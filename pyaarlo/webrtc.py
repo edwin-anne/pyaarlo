@@ -111,6 +111,71 @@ def _parse_http_over_ws_message(text):
     return json.loads(text[header_end + 4:])
 
 
+def _media_section_mids(sdp):
+    """Return the media section mids from an SDP, in m-line order."""
+    mids = []
+    current_mid = None
+    in_media = False
+    for line in sdp.splitlines():
+        if line.startswith("m="):
+            if in_media:
+                mids.append(current_mid)
+            in_media = True
+            current_mid = None
+        elif in_media and line.startswith("a=mid:"):
+            current_mid = line.split(":", 1)[1]
+    if in_media:
+        mids.append(current_mid)
+    return mids
+
+
+def _ensure_answer_mids(answer_sdp, offer_sdp):
+    """FreeSWITCH's answer omits a=mid, which browsers tolerate but aiortc
+    requires in order to match answer media sections back to the offer."""
+    offer_mids = _media_section_mids(offer_sdp)
+    if not offer_mids or any(mid is None for mid in offer_mids):
+        return answer_sdp
+
+    lines = answer_sdp.splitlines()
+    fixed = []
+    media_index = -1
+    media_has_mid = False
+    pending_mid = None
+
+    def flush_pending_mid():
+        nonlocal pending_mid, media_has_mid
+        if pending_mid is not None and not media_has_mid:
+            fixed.append("a=mid:{}".format(pending_mid))
+        pending_mid = None
+        media_has_mid = False
+
+    for line in lines:
+        if line.startswith("m="):
+            flush_pending_mid()
+            media_index += 1
+            pending_mid = (
+                offer_mids[media_index] if media_index < len(offer_mids) else None
+            )
+            fixed.append(line)
+            continue
+
+        if line.startswith("a=mid:"):
+            media_has_mid = True
+
+        if pending_mid is not None and (
+            line.startswith("a=rtpmap:")
+            or line.startswith("a=send")
+            or line.startswith("a=recv")
+            or line.startswith("a=fingerprint:")
+        ):
+            flush_pending_mid()
+
+        fixed.append(line)
+
+    flush_pending_mid()
+    return "\r\n".join(fixed) + "\r\n"
+
+
 class ArloWebRtcSession:
     """One SIP/WebRTC live-view session for a single camera."""
 
@@ -189,6 +254,7 @@ class ArloWebRtcSession:
 
         self._session_id = str(uuid.uuid4())
         answer_sdp = await self._negotiate(self._pc.localDescription.sdp)
+        answer_sdp = _ensure_answer_mids(answer_sdp, self._pc.localDescription.sdp)
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
         await self._wait_connected()
         await self._recorder.start()
