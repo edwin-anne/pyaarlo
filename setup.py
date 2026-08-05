@@ -26,6 +26,9 @@ setup(
         'cryptography',
         'python-slugify'
     ],
+    extras_require={
+        'webrtc': ['aiortc', 'websockets'],
+    },
 
     author='Steve Herrell',
     author_email='steve.herrell@gmail.com',
