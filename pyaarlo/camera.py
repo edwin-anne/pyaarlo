@@ -131,6 +131,7 @@ class ArloCamera(ArloChildDevice):
         self._remote_users = set()
         # active SIP/WebRTC live-view session, if any (see webrtc.py)
         self._webrtc_session = None
+        self._webrtc_starting = False
 
     def _parse_statistic(self, data, scale):
         """Parse binary statistics returned from the history API"""
@@ -1044,17 +1045,41 @@ class ArloCamera(ArloChildDevice):
         the behaviour observed in Arlo's own clients (try WebRTC, catch,
         fall back to RTSP/DASH)."""
         if not self._arlo.cfg.disable_sip_webrtc_streaming and self.supports_sip_webrtc_streaming():
+            session = None
             try:
                 from .webrtc import ArloWebRtcSession
+                with self._lock:
+                    if self._webrtc_session is not None and self._stream_url is not None:
+                        self._local_users.add("streaming")
+                        self._dump_activities("_start_stream_webrtc_existing")
+                        return self._stream_url
+
+                    while self._webrtc_starting:
+                        self._lock.wait(timeout=15)
+                        if self._webrtc_session is not None and self._stream_url is not None:
+                            self._local_users.add("streaming")
+                            self._dump_activities("_start_stream_webrtc_waited")
+                            return self._stream_url
+
+                    self._webrtc_starting = True
+
                 session = ArloWebRtcSession(self)
                 url = session.start()
-                self._webrtc_session = session
                 with self._lock:
+                    self._webrtc_session = session
+                    self._stream_url = url
                     self._local_users.add("streaming")
+                    self._webrtc_starting = False
+                    self._lock.notify_all()
                 return url
             except Exception as e:
                 self.debug("SIP/WebRTC stream failed ({}), falling back to RTSP-cloud".format(e))
-                self._webrtc_session = None
+                if session is not None:
+                    session.stop()
+                with self._lock:
+                    self._webrtc_session = None
+                    self._webrtc_starting = False
+                    self._lock.notify_all()
         return self._start_stream("streaming", user_agent)
 
     def start_snapshot_stream(self, user_agent=None):
