@@ -350,6 +350,24 @@ class ArloCamera(ArloChildDevice):
         if response is not None:
             self._mark_as_idle()
 
+    def _start_user_stream_activity(self):
+        """Request live-view activity without creating the legacy RTSP URL."""
+        response = self._arlo.be.notify(
+            base=self.base_station,
+            body={
+                "action": "set",
+                "properties": {
+                    "activityState": "startUserStream",
+                    "cameraId": self.device_id,
+                },
+                "publishResponse": True,
+                "resource": self.resource_id,
+            },
+            wait_for="response",
+        )
+        self.debug("SIP/WebRTC startUserStream activity response={}".format(response))
+        return response is not None
+
     def _get_sip_info(self):
         """Fetch the SIP/WebRTC call info needed to negotiate the newer live-view path.
 
@@ -1067,6 +1085,7 @@ class ArloCamera(ArloChildDevice):
                     self._webrtc_starting = True
 
                 session = ArloWebRtcSession(self)
+                self._start_user_stream_activity()
                 url = session.start()
                 with self._lock:
                     self._webrtc_session = session
