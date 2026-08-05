@@ -44,7 +44,7 @@ _ICE_GATHERING_TIMEOUT = 5
 _CONNECT_TIMEOUT = 10
 _SIGNALING_TIMEOUT = 10
 _TCP_ACCEPT_TIMEOUT = 120
-_TCP_STARTUP_BUFFER_LIMIT = 1024 * 1024
+_TCP_STARTUP_BUFFER_LIMIT = 4 * 1024 * 1024
 
 
 class WebRtcSessionError(Exception):
@@ -80,6 +80,8 @@ class _TcpSocketWriter:
         self._live_waiting = False
         self._startup_buffer = []
         self._startup_buffered = 0
+        self._startup_chunks_dropped = 0
+        self._startup_bytes_dropped = 0
         self._write_count = 0
         self._write_bytes = 0
 
@@ -149,8 +151,13 @@ class _TcpSocketWriter:
                     return
                 self._accept_error = None
                 startup_buffer = self._startup_buffer
+                startup_buffered = self._startup_buffered
+                startup_chunks_dropped = self._startup_chunks_dropped
+                startup_bytes_dropped = self._startup_bytes_dropped
                 self._startup_buffer = []
                 self._startup_buffered = 0
+                self._startup_chunks_dropped = 0
+                self._startup_bytes_dropped = 0
             try:
                 for chunk in startup_buffer:
                     conn.sendall(chunk)
@@ -167,6 +174,16 @@ class _TcpSocketWriter:
                 self._conns.append(conn)
                 self._lock.notify_all()
             self._debug("SIP/WebRTC TCP client connected")
+            if startup_buffer:
+                self._debug(
+                    "SIP/WebRTC TCP replayed startup buffer: {} chunks / {} bytes"
+                    " (dropped {} chunks / {} bytes)".format(
+                        len(startup_buffer),
+                        startup_buffered,
+                        startup_chunks_dropped,
+                        startup_bytes_dropped,
+                    )
+                )
             if self._on_client is not None:
                 self._on_client()
 
@@ -210,10 +227,16 @@ class _TcpSocketWriter:
         while True:
             with self._lock:
                 if not self._conns and not self._live_waiting:
-                    if self._startup_buffered + len(data) > _TCP_STARTUP_BUFFER_LIMIT:
-                        raise TimeoutError("TCP startup buffer filled before URL was returned")
                     self._startup_buffer.append(data)
                     self._startup_buffered += len(data)
+                    while (
+                        self._startup_buffered > _TCP_STARTUP_BUFFER_LIMIT
+                        and self._startup_buffer
+                    ):
+                        dropped = self._startup_buffer.pop(0)
+                        self._startup_buffered -= len(dropped)
+                        self._startup_chunks_dropped += 1
+                        self._startup_bytes_dropped += len(dropped)
                     return len(data)
             conns = self._wait_for_connection(deadline)
             sent = False
@@ -251,6 +274,8 @@ class _TcpSocketWriter:
             self._conns = []
             self._startup_buffer = []
             self._startup_buffered = 0
+            self._startup_chunks_dropped = 0
+            self._startup_bytes_dropped = 0
             self._lock.notify_all()
         for sock in conns + [self._server]:
             if sock is not None:
@@ -395,6 +420,8 @@ class ArloWebRtcSession:
         self._tcp_writer = None
         self._recorder_started = False
         self._recorder_starting = False
+        self._tracks = []
+        self._video_track_ready = None
 
     def start(self, timeout=15):
         """Start the session; blocks the calling thread until media is
@@ -441,14 +468,18 @@ class ArloWebRtcSession:
 
     async def _async_start(self, ice_servers):
         self._pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        self._video_track_ready = asyncio.Event()
         self._pc.addTransceiver("audio")
         self._pc.addTransceiver("video", direction="recvonly")
 
         @self._pc.on("track")
         def on_track(track):
             self._camera.debug("SIP/WebRTC received {} track".format(track.kind))
+            self._tracks.append(track)
             if self._recorder is not None:
                 self._recorder.addTrack(track)
+            if track.kind == "video" and self._video_track_ready is not None:
+                self._video_track_ready.set()
 
         self._tcp_writer = _TcpSocketWriter(
             camera=self._camera, on_client=self._start_recorder_from_client
@@ -466,8 +497,10 @@ class ArloWebRtcSession:
         answer_sdp = _ensure_answer_mids(answer_sdp, self._pc.localDescription.sdp)
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
         await self._wait_connected()
+        await self._wait_video_track_ready()
+        await self._async_start_recorder()
         self._camera.debug(
-            "SIP/WebRTC peer connection established; recorder will start on TCP client"
+            "SIP/WebRTC peer connection established; recorder is buffering for TCP client"
         )
 
         return self._tcp_writer.url
@@ -477,6 +510,8 @@ class ArloWebRtcSession:
             return
 
         def schedule():
+            if self._tcp_writer is not None:
+                self._tcp_writer.set_live_waiting()
             asyncio.ensure_future(self._async_start_recorder())
 
         self._loop.call_soon_threadsafe(schedule)
@@ -486,7 +521,6 @@ class ArloWebRtcSession:
             return
         self._recorder_starting = True
         try:
-            self._tcp_writer.set_live_waiting()
             await self._recorder.start()
             self._recorder_started = True
             self._camera.debug("SIP/WebRTC recorder started at {}".format(self._tcp_writer.url))
@@ -527,6 +561,16 @@ class ArloWebRtcSession:
             raise WebRtcSessionError(
                 "WebRTC connection state failed: {}".format(self._pc.connectionState)
             )
+
+    async def _wait_video_track_ready(self):
+        if any(track.kind == "video" for track in self._tracks):
+            return
+        if self._video_track_ready is None:
+            return
+        try:
+            await asyncio.wait_for(self._video_track_ready.wait(), timeout=_CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise WebRtcSessionError("WebRTC video track was not received")
 
     async def _negotiate(self, offer_sdp):
         domain = self._sip_call_info["domain"]
