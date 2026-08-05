@@ -44,7 +44,7 @@ _ICE_GATHERING_TIMEOUT = 5
 _CONNECT_TIMEOUT = 10
 _SIGNALING_TIMEOUT = 10
 _TCP_ACCEPT_TIMEOUT = 120
-_TCP_BUFFER_LIMIT = 4 * 1024 * 1024
+_TCP_STARTUP_BUFFER_LIMIT = 1024 * 1024
 
 
 class WebRtcSessionError(Exception):
@@ -64,25 +64,25 @@ class _TcpSocketWriter:
     def __init__(self, host="127.0.0.1", port=0, accept_timeout=_TCP_ACCEPT_TIMEOUT):
         self._host = host
         self._accept_timeout = accept_timeout
-        self._created_at = time.monotonic()
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
         self._conn = None
         self._closed = False
         self._accept_error = None
-        self._buffer = []
-        self._buffered = 0
+        self._live_waiting = False
+        self._startup_buffer = []
+        self._startup_buffered = 0
 
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind((host, port))
         self._server.listen(1)
-        self._server.settimeout(accept_timeout)
+        self._server.settimeout(1)
         self._port = self._server.getsockname()[1]
         self.name = self.url
         self.mode = "wb"
 
         self._thread = threading.Thread(
-            target=self._accept_once,
+            target=self._accept_loop,
             name="ArloWebRtcTcp-{}".format(self._port),
             daemon=True,
         )
@@ -112,74 +112,103 @@ class _TcpSocketWriter:
     def tell(self):
         return 0
 
-    def _accept_once(self):
-        try:
-            conn, _ = self._server.accept()
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception as e:
-            with self._lock:
-                if not self._closed:
-                    self._accept_error = e
-            return
-        finally:
-            try:
-                self._server.close()
-            except Exception:
-                pass
-
-        try:
-            while True:
-                with self._lock:
-                    if self._closed:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        return
-                    pending = self._buffer
-                    self._buffer = []
-                    self._buffered = 0
-                if not pending:
-                    break
-                for chunk in pending:
-                    conn.sendall(chunk)
+    def _accept_loop(self):
+        while True:
             with self._lock:
                 if self._closed:
-                    conn.close()
+                    return
+            try:
+                conn, _ = self._server.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                with self._lock:
+                    if not self._closed:
+                        self._accept_error = e
+                        self._lock.notify_all()
+                return
+
+            with self._lock:
+                if self._closed:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                old_conn = self._conn
+                self._accept_error = None
+                startup_buffer = self._startup_buffer
+                self._startup_buffer = []
+                self._startup_buffered = 0
+            if old_conn is not None:
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+            try:
+                for chunk in startup_buffer:
+                    conn.sendall(chunk)
+            except OSError:
+                self._drop_connection(conn)
+                continue
+            with self._lock:
+                if self._closed:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
                     return
                 self._conn = conn
-        except Exception as e:
-            with self._lock:
-                self._accept_error = e
+                self._lock.notify_all()
+
+    def set_live_waiting(self):
+        with self._lock:
+            self._live_waiting = True
+
+    def _wait_for_connection(self, deadline):
+        with self._lock:
+            while self._conn is None:
+                if self._closed:
+                    raise BrokenPipeError("TCP stream is closed")
+                if self._accept_error is not None:
+                    raise BrokenPipeError(str(self._accept_error))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("no TCP consumer connected")
+                self._lock.wait(timeout=min(remaining, 1))
+            return self._conn
+
+    def _drop_connection(self, conn):
+        with self._lock:
+            if self._conn is conn:
+                self._conn = None
+            self._lock.notify_all()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     def write(self, data):
         if not data:
             return 0
 
         data = bytes(data)
-        with self._lock:
-            if self._closed:
-                raise BrokenPipeError("TCP stream is closed")
-            if self._accept_error is not None:
-                raise BrokenPipeError(str(self._accept_error))
-
-            conn = self._conn
-            if conn is None:
-                if time.monotonic() - self._created_at > self._accept_timeout:
-                    raise TimeoutError("no TCP consumer connected")
-                if self._buffered + len(data) > _TCP_BUFFER_LIMIT:
-                    raise TimeoutError("TCP consumer did not connect before buffer filled")
-                self._buffer.append(data)
-                self._buffered += len(data)
-                return len(data)
-
-        try:
-            conn.sendall(data)
-        except Exception as e:
+        deadline = time.monotonic() + self._accept_timeout
+        while True:
             with self._lock:
-                self._accept_error = e
-            raise
-        return len(data)
+                if self._conn is None and not self._live_waiting:
+                    if self._startup_buffered + len(data) > _TCP_STARTUP_BUFFER_LIMIT:
+                        raise TimeoutError("TCP startup buffer filled before URL was returned")
+                    self._startup_buffer.append(data)
+                    self._startup_buffered += len(data)
+                    return len(data)
+            conn = self._wait_for_connection(deadline)
+            try:
+                conn.sendall(data)
+                return len(data)
+            except OSError:
+                self._drop_connection(conn)
 
     def flush(self):
         return None
@@ -189,8 +218,9 @@ class _TcpSocketWriter:
             self._closed = True
             conn = self._conn
             self._conn = None
-            self._buffer = []
-            self._buffered = 0
+            self._startup_buffer = []
+            self._startup_buffered = 0
+            self._lock.notify_all()
         for sock in (conn, self._server):
             if sock is not None:
                 try:
@@ -403,6 +433,7 @@ class ArloWebRtcSession:
         await self._wait_connected()
         self._camera.debug("SIP/WebRTC peer connection established")
         await self._recorder.start()
+        self._tcp_writer.set_live_waiting()
         self._camera.debug("SIP/WebRTC recorder started at {}".format(self._tcp_writer.url))
 
         return self._tcp_writer.url
