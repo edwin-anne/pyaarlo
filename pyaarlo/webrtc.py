@@ -434,6 +434,27 @@ def _parse_http_over_ws_message(text):
     return json.loads(text[header_end + 4:])
 
 
+def _media_section_ssrcs(sdp, kind):
+    """Return SSRCs advertised in the selected media section."""
+    ssrcs = []
+    in_media = False
+    for line in sdp.splitlines():
+        if line.startswith("m="):
+            parts = line.split()
+            in_media = bool(parts and parts[0] == "m={}".format(kind))
+            continue
+        if not in_media or not line.startswith("a=ssrc:"):
+            continue
+        raw_ssrc = line.split(":", 1)[1].split(None, 1)[0]
+        try:
+            ssrc = int(raw_ssrc)
+        except ValueError:
+            continue
+        if ssrc not in ssrcs:
+            ssrcs.append(ssrc)
+    return ssrcs
+
+
 def _media_section_mids(sdp):
     """Return the media section mids from an SDP, in m-line order."""
     mids = []
@@ -521,6 +542,8 @@ class ArloWebRtcSession:
         self._stats_task = None
         self._video_track_ready = None
         self._silent_audio = None
+        self._video_transceiver = None
+        self._video_pli_task = None
 
     def start(self, timeout=15):
         """Start the session; blocks the calling thread until media is
@@ -571,7 +594,7 @@ class ArloWebRtcSession:
         self._silent_audio = _SilentAudioTrack()
         self._pc.addTrack(self._silent_audio)
         self._camera.debug("SIP/WebRTC added silent outbound audio track")
-        self._pc.addTransceiver("video", direction="recvonly")
+        self._video_transceiver = self._pc.addTransceiver("video", direction="recvonly")
 
         @self._pc.on("iceconnectionstatechange")
         def on_ice_connection_state_change():
@@ -606,9 +629,11 @@ class ArloWebRtcSession:
         self._session_id = str(uuid.uuid4())
         answer_sdp = await self._negotiate(self._pc.localDescription.sdp)
         answer_sdp = _ensure_answer_mids(answer_sdp, self._pc.localDescription.sdp)
+        video_ssrcs = _media_section_ssrcs(answer_sdp, "video")
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
         await self._wait_connected()
         await self._wait_video_track_ready()
+        self._start_video_pli_task(video_ssrcs)
         await self._async_start_recorder()
         self._camera.debug(
             "SIP/WebRTC peer connection established; recorder is buffering for TCP client"
@@ -737,6 +762,42 @@ class ArloWebRtcSession:
                 self._camera.debug("SIP/WebRTC RTP stats: {}".format(current))
                 last = current
 
+    def _start_video_pli_task(self, video_ssrcs):
+        if self._video_pli_task is not None:
+            return
+        if not video_ssrcs:
+            self._camera.debug("SIP/WebRTC answer did not advertise video SSRCs for PLI")
+            return
+        self._camera.debug(
+            "SIP/WebRTC answer video SSRCs for PLI: {}".format(
+                ",".join(str(ssrc) for ssrc in video_ssrcs)
+            )
+        )
+        self._video_pli_task = asyncio.ensure_future(
+            self._async_send_initial_video_pli(video_ssrcs)
+        )
+
+    async def _async_send_initial_video_pli(self, video_ssrcs):
+        receiver = getattr(self._video_transceiver, "receiver", None)
+        send_pli = getattr(receiver, "_send_rtcp_pli", None)
+        if send_pli is None:
+            self._camera.debug("SIP/WebRTC video receiver cannot send PLI")
+            return
+
+        for attempt in range(1, 6):
+            if self._pc is None or self._pc.connectionState in ("failed", "closed"):
+                return
+            try:
+                for ssrc in video_ssrcs:
+                    await send_pli(ssrc)
+                self._camera.debug(
+                    "SIP/WebRTC sent initial video PLI attempt {}".format(attempt)
+                )
+            except Exception as e:
+                self._camera.debug("SIP/WebRTC video PLI failed ({})".format(e))
+                return
+            await asyncio.sleep(1)
+
     async def _wait_ice_gathering_complete(self):
         if self._pc.iceGatheringState == "complete":
             return
@@ -841,6 +902,9 @@ class ArloWebRtcSession:
         if self._stats_task is not None:
             self._stats_task.cancel()
             self._stats_task = None
+        if self._video_pli_task is not None:
+            self._video_pli_task.cancel()
+            self._video_pli_task = None
         if self._pc is not None:
             try:
                 await self._pc.close()
