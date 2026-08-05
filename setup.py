@@ -27,7 +27,7 @@ setup(
         'python-slugify'
     ],
     extras_require={
-        'webrtc': ['aiortc', 'websockets'],
+        'webrtc': ['aiortc', 'av', 'websockets'],
     },
 
     author='Steve Herrell',

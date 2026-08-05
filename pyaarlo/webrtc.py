@@ -17,13 +17,16 @@ in hass-aarlo/HA.
 """
 
 import asyncio
+import fractions
 import json
 import socket
 import threading
 import time
 import uuid
 
+from av import AudioFrame
 from aiortc import (
+    MediaStreamTrack,
     RTCConfiguration,
     RTCIceServer,
     RTCPeerConnection,
@@ -107,6 +110,30 @@ class _DebugMediaTrack:
         if samples is not None:
             parts.append("samples={}".format(samples))
         return ", ".join(parts)
+
+
+class _SilentAudioTrack(MediaStreamTrack):
+    """Send low-rate silence so Arlo's WebRTC side sees a real audio source."""
+
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._sample_rate = 48000
+        self._samples = 960
+        self._timestamp = 0
+        self._time_base = fractions.Fraction(1, self._sample_rate)
+
+    async def recv(self):
+        await asyncio.sleep(self._samples / self._sample_rate)
+        frame = AudioFrame(format="s16", layout="stereo", samples=self._samples)
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        frame.sample_rate = self._sample_rate
+        frame.pts = self._timestamp
+        frame.time_base = self._time_base
+        self._timestamp += self._samples
+        return frame
 
 
 class _TcpSocketWriter:
@@ -343,7 +370,20 @@ class _TcpSocketWriter:
 def _build_ice_servers(ice_servers_data):
     servers = []
     for entry in ice_servers_data or []:
-        kwargs = {"urls": "{}:{}:{}".format(entry.get("type"), entry.get("domain"), entry.get("port"))}
+        server_type = entry.get("type")
+        domain = entry.get("domain")
+        port = entry.get("port")
+        if not server_type or not domain or not port:
+            continue
+
+        url = "{}:{}:{}".format(server_type, domain, port)
+        transport = entry.get("transport")
+        if server_type in ("turn", "turns") and transport:
+            # aiortc defaults TURN URLs without ?transport= to UDP. Arlo gives
+            # separate TCP/UDP TURN entries, so keep that distinction.
+            url = "{}?transport={}".format(url, transport)
+
+        kwargs = {"urls": url}
         if entry.get("username"):
             kwargs["username"] = entry["username"]
         if entry.get("credential"):
@@ -480,6 +520,7 @@ class ArloWebRtcSession:
         self._recorder_debug_tasks = set()
         self._stats_task = None
         self._video_track_ready = None
+        self._silent_audio = None
 
     def start(self, timeout=15):
         """Start the session; blocks the calling thread until media is
@@ -527,8 +568,20 @@ class ArloWebRtcSession:
     async def _async_start(self, ice_servers):
         self._pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
         self._video_track_ready = asyncio.Event()
-        self._pc.addTransceiver("audio")
+        self._silent_audio = _SilentAudioTrack()
+        self._pc.addTrack(self._silent_audio)
+        self._camera.debug("SIP/WebRTC added silent outbound audio track")
         self._pc.addTransceiver("video", direction="recvonly")
+
+        @self._pc.on("iceconnectionstatechange")
+        def on_ice_connection_state_change():
+            self._camera.debug("SIP/WebRTC ICE state={}".format(self._pc.iceConnectionState))
+
+        @self._pc.on("connectionstatechange")
+        def on_connection_state_change():
+            self._camera.debug(
+                "SIP/WebRTC connection state={}".format(self._pc.connectionState)
+            )
 
         @self._pc.on("track")
         def on_track(track):
@@ -643,24 +696,43 @@ class ArloWebRtcSession:
             except Exception as e:
                 self._camera.debug("SIP/WebRTC stats failed ({})".format(e))
                 return
-            inbound = []
+            lines = []
             for report in stats.values():
-                if getattr(report, "type", None) != "inbound-rtp":
-                    continue
-                kind = (
-                    getattr(report, "kind", None)
-                    or getattr(report, "mediaType", None)
-                    or "unknown"
-                )
-                inbound.append(
-                    "{} packets={} bytes={} frames={}".format(
-                        kind,
-                        getattr(report, "packetsReceived", None),
-                        getattr(report, "bytesReceived", None),
-                        getattr(report, "framesDecoded", None),
+                report_type = getattr(report, "type", None)
+                if report_type in ("inbound-rtp", "outbound-rtp"):
+                    kind = (
+                        getattr(report, "kind", None)
+                        or getattr(report, "mediaType", None)
+                        or "unknown"
                     )
-                )
-            current = "; ".join(sorted(inbound)) if inbound else "no inbound-rtp stats"
+                    if report_type == "inbound-rtp":
+                        lines.append(
+                            "in {} packets={} bytes={} frames={}".format(
+                                kind,
+                                getattr(report, "packetsReceived", None),
+                                getattr(report, "bytesReceived", None),
+                                getattr(report, "framesDecoded", None),
+                            )
+                        )
+                    else:
+                        lines.append(
+                            "out {} packets={} bytes={}".format(
+                                kind,
+                                getattr(report, "packetsSent", None),
+                                getattr(report, "bytesSent", None),
+                            )
+                        )
+                elif report_type == "transport":
+                    lines.append(
+                        "transport dtls={} sent={}/{} recv={}/{}".format(
+                            getattr(report, "dtlsState", None),
+                            getattr(report, "packetsSent", None),
+                            getattr(report, "bytesSent", None),
+                            getattr(report, "packetsReceived", None),
+                            getattr(report, "bytesReceived", None),
+                        )
+                    )
+            current = "; ".join(sorted(lines)) if lines else "no RTP/transport stats"
             if current != last:
                 self._camera.debug("SIP/WebRTC RTP stats: {}".format(current))
                 last = current
