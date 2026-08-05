@@ -1085,7 +1085,10 @@ class ArloCamera(ArloChildDevice):
                     self._webrtc_starting = True
 
                 session = ArloWebRtcSession(self)
-                self._start_user_stream_activity()
+                # Arlo's web SIP/WebRTC path does not send the legacy
+                # startUserStream activity command before sipInfo/initiateOffer.
+                # On newer standalone cameras that command can be rejected with
+                # 4006 "Invalid camera activity state change" and no media flows.
                 url = session.start()
                 with self._lock:
                     self._webrtc_session = session
