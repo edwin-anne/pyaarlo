@@ -63,11 +63,13 @@ class _TcpSocketWriter:
 
     def __init__(
         self,
+        camera=None,
         host="127.0.0.1",
         port=0,
         accept_timeout=_TCP_ACCEPT_TIMEOUT,
         on_client=None,
     ):
+        self._camera = camera
         self._host = host
         self._accept_timeout = accept_timeout
         self._on_client = on_client
@@ -78,6 +80,8 @@ class _TcpSocketWriter:
         self._live_waiting = False
         self._startup_buffer = []
         self._startup_buffered = 0
+        self._write_count = 0
+        self._write_bytes = 0
 
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -162,12 +166,17 @@ class _TcpSocketWriter:
                     return
                 self._conns.append(conn)
                 self._lock.notify_all()
+            self._debug("SIP/WebRTC TCP client connected")
             if self._on_client is not None:
                 self._on_client()
 
     def set_live_waiting(self):
         with self._lock:
             self._live_waiting = True
+
+    def _debug(self, msg):
+        if self._camera is not None:
+            self._camera.debug(msg)
 
     def _wait_for_connection(self, deadline):
         with self._lock:
@@ -213,8 +222,23 @@ class _TcpSocketWriter:
                     conn.sendall(data)
                     sent = True
                 except OSError:
+                    self._debug("SIP/WebRTC TCP client disconnected during write")
                     self._drop_connection(conn)
             if sent:
+                self._write_count += 1
+                self._write_bytes += len(data)
+                if self._write_count == 1:
+                    self._debug(
+                        "SIP/WebRTC TCP first write: {} bytes, prefix={}".format(
+                            len(data), data[:16].hex()
+                        )
+                    )
+                elif self._write_count in (10, 100):
+                    self._debug(
+                        "SIP/WebRTC TCP wrote {} chunks / {} bytes".format(
+                            self._write_count, self._write_bytes
+                        )
+                    )
                 return len(data)
 
     def flush(self):
@@ -426,7 +450,9 @@ class ArloWebRtcSession:
             if self._recorder is not None:
                 self._recorder.addTrack(track)
 
-        self._tcp_writer = _TcpSocketWriter(on_client=self._start_recorder_from_client)
+        self._tcp_writer = _TcpSocketWriter(
+            camera=self._camera, on_client=self._start_recorder_from_client
+        )
         self._port = self._tcp_writer.port
         self._camera.debug("SIP/WebRTC local TCP listener ready at {}".format(self._tcp_writer.url))
         self._recorder = MediaRecorder(self._tcp_writer, format="mpegts")
