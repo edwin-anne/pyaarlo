@@ -3,6 +3,7 @@ import json
 import pprint
 import threading
 import time
+import uuid
 import zlib
 
 from .constant import (
@@ -358,7 +359,9 @@ class ArloCamera(ArloChildDevice):
         """
         params = {
             "cameraId": self.device_id,
+            "eventId": "FE!{}".format(uuid.uuid4()),
             "modelId": self.model_id,
+            "time": str(int(time.time() * 1000)),
             "uniqueId": "{}_{}".format(self._arlo.be.user_id, self.device_id),
         }
         headers = {"xcloudId": self.xcloud_id, "cameraId": self.device_id}

@@ -54,6 +54,61 @@ class WebRtcSessionError(Exception):
     """
 
 
+class _DebugMediaTrack:
+    """Proxy a media track so we can see whether frames reach MediaRecorder."""
+
+    def __init__(self, camera, track):
+        self._camera = camera
+        self._track = track
+        self._frames = 0
+        self._ended_logged = False
+        self.kind = track.kind
+
+    @property
+    def readyState(self):
+        return self._track.readyState
+
+    async def recv(self):
+        try:
+            frame = await self._track.recv()
+        except Exception as e:
+            if not self._ended_logged:
+                self._ended_logged = True
+                self._camera.debug(
+                    "SIP/WebRTC {} track recv ended/failed: {}({})".format(
+                        self.kind, type(e).__name__, e
+                    )
+                )
+            raise
+
+        self._frames += 1
+        if self._frames in (1, 10, 100):
+            self._camera.debug(
+                "SIP/WebRTC {} track frame {}: {}".format(
+                    self.kind, self._frames, self._describe_frame(frame)
+                )
+            )
+        return frame
+
+    def stop(self):
+        self._track.stop()
+
+    def _describe_frame(self, frame):
+        parts = [
+            type(frame).__name__,
+            "pts={}".format(getattr(frame, "pts", None)),
+            "time_base={}".format(getattr(frame, "time_base", None)),
+        ]
+        width = getattr(frame, "width", None)
+        height = getattr(frame, "height", None)
+        if width is not None and height is not None:
+            parts.append("size={}x{}".format(width, height))
+        samples = getattr(frame, "samples", None)
+        if samples is not None:
+            parts.append("samples={}".format(samples))
+        return ", ".join(parts)
+
+
 class _TcpSocketWriter:
     """Small write-only file object backed by a local TCP listener.
 
@@ -421,6 +476,9 @@ class ArloWebRtcSession:
         self._recorder_started = False
         self._recorder_starting = False
         self._tracks = []
+        self._recorder_track_ids = set()
+        self._recorder_debug_tasks = set()
+        self._stats_task = None
         self._video_track_ready = None
 
     def start(self, timeout=15):
@@ -477,7 +535,7 @@ class ArloWebRtcSession:
             self._camera.debug("SIP/WebRTC received {} track".format(track.kind))
             self._tracks.append(track)
             if self._recorder is not None:
-                self._recorder.addTrack(track)
+                self._add_recorder_track(track)
             if track.kind == "video" and self._video_track_ready is not None:
                 self._video_track_ready.set()
 
@@ -516,18 +574,96 @@ class ArloWebRtcSession:
 
         self._loop.call_soon_threadsafe(schedule)
 
+    def _add_recorder_track(self, track):
+        track_id = id(track)
+        if track_id in self._recorder_track_ids:
+            return
+        self._recorder_track_ids.add(track_id)
+        self._recorder.addTrack(_DebugMediaTrack(self._camera, track))
+        self._camera.debug("SIP/WebRTC recorder added {} track".format(track.kind))
+
     async def _async_start_recorder(self):
         if self._recorder_started or self._recorder_starting:
             return
         self._recorder_starting = True
         try:
             await self._recorder.start()
+            self._attach_recorder_task_debug()
+            if self._stats_task is None:
+                self._stats_task = asyncio.ensure_future(self._async_log_media_stats())
             self._recorder_started = True
             self._camera.debug("SIP/WebRTC recorder started at {}".format(self._tcp_writer.url))
         except Exception as e:
             self._camera.debug("SIP/WebRTC recorder start failed ({})".format(e))
         finally:
             self._recorder_starting = False
+
+    def _attach_recorder_task_debug(self):
+        tracks = getattr(self._recorder, "_MediaRecorder__tracks", {})
+        for track, context in list(tracks.items()):
+            task = getattr(context, "task", None)
+            if task is None or task in self._recorder_debug_tasks:
+                continue
+            self._recorder_debug_tasks.add(task)
+            kind = getattr(track, "kind", "unknown")
+            task.add_done_callback(
+                lambda done_task, task_kind=kind: self._recorder_task_done(
+                    task_kind, done_task
+                )
+            )
+
+    def _recorder_task_done(self, kind, task):
+        if task.cancelled():
+            self._camera.debug("SIP/WebRTC recorder {} task cancelled".format(kind))
+            return
+        try:
+            exc = task.exception()
+        except Exception as e:
+            self._camera.debug(
+                "SIP/WebRTC recorder {} task exception lookup failed ({})".format(kind, e)
+            )
+            return
+        if exc is not None:
+            self._camera.debug(
+                "SIP/WebRTC recorder {} task failed: {}({})".format(
+                    kind, type(exc).__name__, exc
+                )
+            )
+        else:
+            self._camera.debug("SIP/WebRTC recorder {} task ended".format(kind))
+
+    async def _async_log_media_stats(self):
+        last = None
+        for _ in range(12):
+            await asyncio.sleep(5)
+            if self._pc is None:
+                return
+            try:
+                stats = await self._pc.getStats()
+            except Exception as e:
+                self._camera.debug("SIP/WebRTC stats failed ({})".format(e))
+                return
+            inbound = []
+            for report in stats.values():
+                if getattr(report, "type", None) != "inbound-rtp":
+                    continue
+                kind = (
+                    getattr(report, "kind", None)
+                    or getattr(report, "mediaType", None)
+                    or "unknown"
+                )
+                inbound.append(
+                    "{} packets={} bytes={} frames={}".format(
+                        kind,
+                        getattr(report, "packetsReceived", None),
+                        getattr(report, "bytesReceived", None),
+                        getattr(report, "framesDecoded", None),
+                    )
+                )
+            current = "; ".join(sorted(inbound)) if inbound else "no inbound-rtp stats"
+            if current != last:
+                self._camera.debug("SIP/WebRTC RTP stats: {}".format(current))
+                last = current
 
     async def _wait_ice_gathering_complete(self):
         if self._pc.iceGatheringState == "complete":
@@ -630,6 +766,9 @@ class ArloWebRtcSession:
                 await self._recorder.stop()
             except Exception:
                 pass
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            self._stats_task = None
         if self._pc is not None:
             try:
                 await self._pc.close()
