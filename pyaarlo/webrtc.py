@@ -61,9 +61,16 @@ class _TcpSocketWriter:
     guarantees the advertised localhost port is listening before HA receives it.
     """
 
-    def __init__(self, host="127.0.0.1", port=0, accept_timeout=_TCP_ACCEPT_TIMEOUT):
+    def __init__(
+        self,
+        host="127.0.0.1",
+        port=0,
+        accept_timeout=_TCP_ACCEPT_TIMEOUT,
+        on_client=None,
+    ):
         self._host = host
         self._accept_timeout = accept_timeout
+        self._on_client = on_client
         self._lock = threading.Condition()
         self._conn = None
         self._closed = False
@@ -161,6 +168,8 @@ class _TcpSocketWriter:
                     return
                 self._conn = conn
                 self._lock.notify_all()
+            if self._on_client is not None:
+                self._on_client()
 
     def set_live_waiting(self):
         with self._lock:
@@ -362,6 +371,8 @@ class ArloWebRtcSession:
         self._thread = None
         self._port = None
         self._tcp_writer = None
+        self._recorder_started = False
+        self._recorder_starting = False
 
     def start(self, timeout=15):
         """Start the session; blocks the calling thread until media is
@@ -417,7 +428,7 @@ class ArloWebRtcSession:
             if self._recorder is not None:
                 self._recorder.addTrack(track)
 
-        self._tcp_writer = _TcpSocketWriter()
+        self._tcp_writer = _TcpSocketWriter(on_client=self._start_recorder_from_client)
         self._port = self._tcp_writer.port
         self._camera.debug("SIP/WebRTC local TCP listener ready at {}".format(self._tcp_writer.url))
         self._recorder = MediaRecorder(self._tcp_writer, format="mpegts")
@@ -431,12 +442,34 @@ class ArloWebRtcSession:
         answer_sdp = _ensure_answer_mids(answer_sdp, self._pc.localDescription.sdp)
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
         await self._wait_connected()
-        self._camera.debug("SIP/WebRTC peer connection established")
-        await self._recorder.start()
-        self._tcp_writer.set_live_waiting()
-        self._camera.debug("SIP/WebRTC recorder started at {}".format(self._tcp_writer.url))
+        self._camera.debug(
+            "SIP/WebRTC peer connection established; recorder will start on TCP client"
+        )
 
         return self._tcp_writer.url
+
+    def _start_recorder_from_client(self):
+        if self._loop is None:
+            return
+
+        def schedule():
+            asyncio.ensure_future(self._async_start_recorder())
+
+        self._loop.call_soon_threadsafe(schedule)
+
+    async def _async_start_recorder(self):
+        if self._recorder_started or self._recorder_starting:
+            return
+        self._recorder_starting = True
+        try:
+            self._tcp_writer.set_live_waiting()
+            await self._recorder.start()
+            self._recorder_started = True
+            self._camera.debug("SIP/WebRTC recorder started at {}".format(self._tcp_writer.url))
+        except Exception as e:
+            self._camera.debug("SIP/WebRTC recorder start failed ({})".format(e))
+        finally:
+            self._recorder_starting = False
 
     async def _wait_ice_gathering_complete(self):
         if self._pc.iceGatheringState == "complete":
