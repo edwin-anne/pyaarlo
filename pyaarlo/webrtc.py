@@ -72,7 +72,7 @@ class _TcpSocketWriter:
         self._accept_timeout = accept_timeout
         self._on_client = on_client
         self._lock = threading.Condition()
-        self._conn = None
+        self._conns = []
         self._closed = False
         self._accept_error = None
         self._live_waiting = False
@@ -143,16 +143,10 @@ class _TcpSocketWriter:
                     except Exception:
                         pass
                     return
-                old_conn = self._conn
                 self._accept_error = None
                 startup_buffer = self._startup_buffer
                 self._startup_buffer = []
                 self._startup_buffered = 0
-            if old_conn is not None:
-                try:
-                    old_conn.close()
-                except Exception:
-                    pass
             try:
                 for chunk in startup_buffer:
                     conn.sendall(chunk)
@@ -166,7 +160,7 @@ class _TcpSocketWriter:
                     except Exception:
                         pass
                     return
-                self._conn = conn
+                self._conns.append(conn)
                 self._lock.notify_all()
             if self._on_client is not None:
                 self._on_client()
@@ -177,7 +171,7 @@ class _TcpSocketWriter:
 
     def _wait_for_connection(self, deadline):
         with self._lock:
-            while self._conn is None:
+            while not self._conns:
                 if self._closed:
                     raise BrokenPipeError("TCP stream is closed")
                 if self._accept_error is not None:
@@ -186,12 +180,12 @@ class _TcpSocketWriter:
                 if remaining <= 0:
                     raise TimeoutError("no TCP consumer connected")
                 self._lock.wait(timeout=min(remaining, 1))
-            return self._conn
+            return list(self._conns)
 
     def _drop_connection(self, conn):
         with self._lock:
-            if self._conn is conn:
-                self._conn = None
+            if conn in self._conns:
+                self._conns.remove(conn)
             self._lock.notify_all()
         try:
             conn.close()
@@ -206,18 +200,22 @@ class _TcpSocketWriter:
         deadline = time.monotonic() + self._accept_timeout
         while True:
             with self._lock:
-                if self._conn is None and not self._live_waiting:
+                if not self._conns and not self._live_waiting:
                     if self._startup_buffered + len(data) > _TCP_STARTUP_BUFFER_LIMIT:
                         raise TimeoutError("TCP startup buffer filled before URL was returned")
                     self._startup_buffer.append(data)
                     self._startup_buffered += len(data)
                     return len(data)
-            conn = self._wait_for_connection(deadline)
-            try:
-                conn.sendall(data)
+            conns = self._wait_for_connection(deadline)
+            sent = False
+            for conn in conns:
+                try:
+                    conn.sendall(data)
+                    sent = True
+                except OSError:
+                    self._drop_connection(conn)
+            if sent:
                 return len(data)
-            except OSError:
-                self._drop_connection(conn)
 
     def flush(self):
         return None
@@ -225,12 +223,12 @@ class _TcpSocketWriter:
     def close(self):
         with self._lock:
             self._closed = True
-            conn = self._conn
-            self._conn = None
+            conns = self._conns
+            self._conns = []
             self._startup_buffer = []
             self._startup_buffered = 0
             self._lock.notify_all()
-        for sock in (conn, self._server):
+        for sock in conns + [self._server]:
             if sock is not None:
                 try:
                     sock.close()
