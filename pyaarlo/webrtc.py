@@ -20,6 +20,7 @@ import asyncio
 import json
 import socket
 import threading
+import time
 import uuid
 
 from aiortc import (
@@ -42,6 +43,8 @@ _ARLO_WEBRTC_ACCEPT_LANGUAGE = "en-IN,en-GB;q=0.9,en;q=0.8"
 _ICE_GATHERING_TIMEOUT = 5
 _CONNECT_TIMEOUT = 10
 _SIGNALING_TIMEOUT = 10
+_TCP_ACCEPT_TIMEOUT = 30
+_TCP_BUFFER_LIMIT = 4 * 1024 * 1024
 
 
 class WebRtcSessionError(Exception):
@@ -51,10 +54,149 @@ class WebRtcSessionError(Exception):
     """
 
 
-def _find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+class _TcpSocketWriter:
+    """Small write-only file object backed by a local TCP listener.
+
+    PyAV/FFmpeg's tcp listen URL handling is not consistent across builds. This
+    guarantees the advertised localhost port is listening before HA receives it.
+    """
+
+    def __init__(self, host="127.0.0.1", port=0, accept_timeout=_TCP_ACCEPT_TIMEOUT):
+        self._host = host
+        self._accept_timeout = accept_timeout
+        self._created_at = time.monotonic()
+        self._lock = threading.Lock()
+        self._conn = None
+        self._closed = False
+        self._accept_error = None
+        self._buffer = []
+        self._buffered = 0
+
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind((host, port))
+        self._server.listen(1)
+        self._server.settimeout(accept_timeout)
+        self._port = self._server.getsockname()[1]
+        self.name = self.url
+        self.mode = "wb"
+
+        self._thread = threading.Thread(
+            target=self._accept_once,
+            name="ArloWebRtcTcp-{}".format(self._port),
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def port(self):
+        return self._port
+
+    @property
+    def url(self):
+        return "tcp://{}:{}".format(self._host, self._port)
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def tell(self):
+        return 0
+
+    def _accept_once(self):
+        try:
+            conn, _ = self._server.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception as e:
+            with self._lock:
+                if not self._closed:
+                    self._accept_error = e
+            return
+        finally:
+            try:
+                self._server.close()
+            except Exception:
+                pass
+
+        try:
+            while True:
+                with self._lock:
+                    if self._closed:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        return
+                    pending = self._buffer
+                    self._buffer = []
+                    self._buffered = 0
+                if not pending:
+                    break
+                for chunk in pending:
+                    conn.sendall(chunk)
+            with self._lock:
+                if self._closed:
+                    conn.close()
+                    return
+                self._conn = conn
+        except Exception as e:
+            with self._lock:
+                self._accept_error = e
+
+    def write(self, data):
+        if not data:
+            return 0
+
+        data = bytes(data)
+        with self._lock:
+            if self._closed:
+                raise BrokenPipeError("TCP stream is closed")
+            if self._accept_error is not None:
+                raise BrokenPipeError(str(self._accept_error))
+
+            conn = self._conn
+            if conn is None:
+                if time.monotonic() - self._created_at > self._accept_timeout:
+                    raise TimeoutError("no TCP consumer connected")
+                if self._buffered + len(data) > _TCP_BUFFER_LIMIT:
+                    raise TimeoutError("TCP consumer did not connect before buffer filled")
+                self._buffer.append(data)
+                self._buffered += len(data)
+                return len(data)
+
+        try:
+            conn.sendall(data)
+        except Exception as e:
+            with self._lock:
+                self._accept_error = e
+            raise
+        return len(data)
+
+    def flush(self):
+        return None
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            conn = self._conn
+            self._conn = None
+            self._buffer = []
+            self._buffered = 0
+        for sock in (conn, self._server):
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
 
 def _build_ice_servers(ice_servers_data):
@@ -189,6 +331,7 @@ class ArloWebRtcSession:
         self._loop = None
         self._thread = None
         self._port = None
+        self._tcp_writer = None
 
     def start(self, timeout=15):
         """Start the session; blocks the calling thread until media is
@@ -240,13 +383,14 @@ class ArloWebRtcSession:
 
         @self._pc.on("track")
         def on_track(track):
+            self._camera.debug("SIP/WebRTC received {} track".format(track.kind))
             if self._recorder is not None:
                 self._recorder.addTrack(track)
 
-        self._port = _find_free_port()
-        self._recorder = MediaRecorder(
-            "tcp://127.0.0.1:{}?listen=1".format(self._port), format="mpegts"
-        )
+        self._tcp_writer = _TcpSocketWriter()
+        self._port = self._tcp_writer.port
+        self._camera.debug("SIP/WebRTC local TCP listener ready at {}".format(self._tcp_writer.url))
+        self._recorder = MediaRecorder(self._tcp_writer, format="mpegts")
 
         offer = await self._pc.createOffer()
         await self._pc.setLocalDescription(offer)
@@ -257,9 +401,11 @@ class ArloWebRtcSession:
         answer_sdp = _ensure_answer_mids(answer_sdp, self._pc.localDescription.sdp)
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
         await self._wait_connected()
+        self._camera.debug("SIP/WebRTC peer connection established")
         await self._recorder.start()
+        self._camera.debug("SIP/WebRTC recorder started at {}".format(self._tcp_writer.url))
 
-        return "tcp://127.0.0.1:{}".format(self._port)
+        return self._tcp_writer.url
 
     async def _wait_ice_gathering_complete(self):
         if self._pc.iceGatheringState == "complete":
@@ -355,5 +501,10 @@ class ArloWebRtcSession:
         if self._pc is not None:
             try:
                 await self._pc.close()
+            except Exception:
+                pass
+        if self._tcp_writer is not None:
+            try:
+                self._tcp_writer.close()
             except Exception:
                 pass
