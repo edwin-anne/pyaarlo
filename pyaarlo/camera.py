@@ -1069,15 +1069,43 @@ class ArloCamera(ArloChildDevice):
             session = None
             try:
                 from .webrtc import ArloWebRtcSession
+                dead_session = None
                 with self._lock:
-                    if self._webrtc_session is not None and self._stream_url is not None:
+                    if (
+                        self._webrtc_session is not None
+                        and self._stream_url is not None
+                        and self._webrtc_session.is_alive
+                    ):
                         self._local_users.add("streaming")
                         self._dump_activities("_start_stream_webrtc_existing")
                         return self._stream_url
+                    if self._webrtc_session is not None and not self._webrtc_session.is_alive:
+                        # Died in the background (ICE failure, consent
+                        # timeout) - don't keep handing out its dead URL. Only
+                        # clear the reference here (fast); the actual
+                        # session.stop() below can block for up to ~10s
+                        # (aiortc/thread teardown) and MUST NOT run while
+                        # holding this lock, or every other concurrent
+                        # get_stream()/wait_for_user_stream() caller stalls
+                        # behind it - this was previously stalling Home
+                        # Assistant's own stream_source() past its own
+                        # timeout, producing "Timeout getting stream source"
+                        # even though the underlying session was healthy.
+                        dead_session = self._webrtc_session
+                        self._webrtc_session = None
+                        self._stream_url = None
 
+                if dead_session is not None:
+                    dead_session.stop()
+
+                with self._lock:
                     while self._webrtc_starting:
                         self._lock.wait(timeout=15)
-                        if self._webrtc_session is not None and self._stream_url is not None:
+                        if (
+                            self._webrtc_session is not None
+                            and self._stream_url is not None
+                            and self._webrtc_session.is_alive
+                        ):
                             self._local_users.add("streaming")
                             self._dump_activities("_start_stream_webrtc_waited")
                             return self._stream_url
@@ -1085,10 +1113,18 @@ class ArloCamera(ArloChildDevice):
                     self._webrtc_starting = True
 
                 session = ArloWebRtcSession(self)
-                # Arlo's web SIP/WebRTC path does not send the legacy
-                # startUserStream activity command before sipInfo/initiateOffer.
-                # On newer standalone cameras that command can be rejected with
-                # 4006 "Invalid camera activity state change" and no media flows.
+                # Deliberately no _start_user_stream_activity() here. Arlo's
+                # own web player does not send it before sipInfo, and it is
+                # actively harmful: it opens a *legacy RTSP* user stream
+                # alongside the SIP one. Nobody ever pulls that RTSP URL, so
+                # the backend expires it after ~10s and flips activityState
+                # back to idle - which downstream consumers read as "the live
+                # view stopped" and use to tear down a SIP session that is
+                # still perfectly healthy. It also draws a stream of
+                # "4006 Invalid camera activity state change" errors. It was
+                # only ever a speculative nudge from when no media flowed at
+                # all; the real blocker was DTLS (see webrtc.py,
+                # _patch_aiortc_dtls_record_framing).
                 url = session.start()
                 with self._lock:
                     self._webrtc_session = session
@@ -1632,6 +1668,17 @@ class ArloCamera(ArloChildDevice):
                 return False
         return super().has_capability(cap)
 
+    @property
+    def has_live_webrtc_session(self):
+        """True while a SIP/WebRTC live-view session is up and negotiated.
+
+        The camera's own `activityState` only describes the legacy RTSP path,
+        so it is not a usable health signal for this one - the backend reports
+        idle within seconds of the SIP call being established. Consumers that
+        tear down on idle should check this first."""
+        session = self._webrtc_session
+        return session is not None and session.is_alive
+
     def supports_sip_webrtc_streaming(self):
         """Whether this camera can use the newer SIP/WebRTC live-view path.
 
@@ -1643,15 +1690,31 @@ class ArloCamera(ArloChildDevice):
         """
         caps = _get_model_capabilities(self.model_id)
         if not caps or not caps.get("Streaming", {}).get("SIPStreaming"):
+            self.debug(
+                "SIP/WebRTC-DBG capability check: model={} caps_found={} SIPStreaming={}".format(
+                    self.model_id, bool(caps), bool((caps or {}).get("Streaming", {}).get("SIPStreaming"))
+                )
+            )
             return False
 
         if self.parent_id == self.device_id:
+            self.debug("SIP/WebRTC-DBG capability check: is own gateway, parent_id=device_id={}".format(self.device_id))
             return True
 
         base_station = self.base_station
         if base_station is None:
+            self.debug(
+                "SIP/WebRTC-DBG capability check: parent_id={} != device_id={}, no base_station".format(
+                    self.parent_id, self.device_id
+                )
+            )
             return False
         parent_caps = _get_model_capabilities(base_station.model_id)
-        if not parent_caps:
-            return False
-        return bool(parent_caps.get("sipLiveStream", {}).get("supported"))
+        result = bool((parent_caps or {}).get("sipLiveStream", {}).get("supported"))
+        self.debug(
+            "SIP/WebRTC-DBG capability check: parent_id={} device_id={} base_station.model_id={}"
+            " parent_caps_found={} sipLiveStream_supported={}".format(
+                self.parent_id, self.device_id, base_station.model_id, bool(parent_caps), result
+            )
+        )
+        return result
