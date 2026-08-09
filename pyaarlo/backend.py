@@ -1058,6 +1058,7 @@ class ArloBackEnd(object):
                 self._arlo.error("login failed: 2fa: no secondary choices available")
                 return AuthResult.FAILED
 
+            quick_start_complete = False
             if code == 200:
                 payload = {
                     "factorId": factor_id,
@@ -1066,12 +1067,15 @@ class ArloBackEnd(object):
                 }
                 self._options = self.auth_options(AUTH_START_PATH, headers)
                 code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-                if code != 200:
+                if code == 200:
+                    quick_start_complete = True
+                else:
                     self._arlo.warning(
                         f"quick start failed: {code} - {body}; trying configured 2FA"
                     )
                     self._needs_pairing = True
                     factor_id = None
+                    factors_of_type = []
                     factors = self.auth_get(
                         AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
                     )
@@ -1098,7 +1102,7 @@ class ArloBackEnd(object):
                         self._arlo.error("login failed: 2fa: no secondary choices available")
                         return AuthResult.FAILED
 
-            elif tfa != TFA_PUSH_SOURCE:
+            if not quick_start_complete and tfa != TFA_PUSH_SOURCE:
                 # snapshot 2fa before sending in request
                 if not tfa.start():
                     self._arlo.error("login failed: 2fa: startup failed")
@@ -1142,7 +1146,7 @@ class ArloBackEnd(object):
                 if code != 200:
                     self._arlo.error(f"login failed: finish failed: {code} - {body}")
                     return AuthResult.FAILED
-            else:
+            elif not quick_start_complete:
                 # start authentication
                 self.debug(
                     "starting auth with {}".format(self._arlo.cfg.tfa_type)
