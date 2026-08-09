@@ -459,14 +459,19 @@ class ArloCamera(ArloChildDevice):
         return self._stream_url
 
     def _stop_stream(self, stopping_for="streaming"):
-        if self._webrtc_session is not None:
-            self._webrtc_session.stop()
-            self._webrtc_session = None
+        webrtc_session = None
         with self._lock:
             self._local_users.discard(stopping_for)
             self._dump_activities("_stop_stream")
             if self.has_any_local_users:
                 return
+            if self._webrtc_session is not None:
+                webrtc_session = self._webrtc_session
+                self._webrtc_session = None
+                self._stream_url = None
+        if webrtc_session is not None:
+            webrtc_session.stop()
+            return
         self._stop_activity()
 
     def _event_handler(self, resource, event):
@@ -1690,31 +1695,13 @@ class ArloCamera(ArloChildDevice):
         """
         caps = _get_model_capabilities(self.model_id)
         if not caps or not caps.get("Streaming", {}).get("SIPStreaming"):
-            self.debug(
-                "SIP/WebRTC-DBG capability check: model={} caps_found={} SIPStreaming={}".format(
-                    self.model_id, bool(caps), bool((caps or {}).get("Streaming", {}).get("SIPStreaming"))
-                )
-            )
             return False
 
         if self.parent_id == self.device_id:
-            self.debug("SIP/WebRTC-DBG capability check: is own gateway, parent_id=device_id={}".format(self.device_id))
             return True
 
         base_station = self.base_station
         if base_station is None:
-            self.debug(
-                "SIP/WebRTC-DBG capability check: parent_id={} != device_id={}, no base_station".format(
-                    self.parent_id, self.device_id
-                )
-            )
             return False
         parent_caps = _get_model_capabilities(base_station.model_id)
-        result = bool((parent_caps or {}).get("sipLiveStream", {}).get("supported"))
-        self.debug(
-            "SIP/WebRTC-DBG capability check: parent_id={} device_id={} base_station.model_id={}"
-            " parent_caps_found={} sipLiveStream_supported={}".format(
-                self.parent_id, self.device_id, base_station.model_id, bool(parent_caps), result
-            )
-        )
-        return result
+        return bool((parent_caps or {}).get("sipLiveStream", {}).get("supported"))

@@ -6,6 +6,7 @@ logic in pyaarlo.camera, using lightweight duck-typed fakes rather than a
 full ArloCamera instance so the tests don't need real device/backend wiring.
 """
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -102,7 +103,7 @@ def test_build_ice_servers():
     ])
     assert len(servers) == 2
     assert servers[0].urls == "stun:relay02-z1-prod.ar.arlo.com:19302"
-    assert servers[1].urls == "turn:relay02-z1-prod.ar.arlo.com:443"
+    assert servers[1].urls == "turn:relay02-z1-prod.ar.arlo.com:443?transport=tcp"
     assert servers[1].username == "u"
     assert servers[1].credential == "c"
 
@@ -238,6 +239,9 @@ def _fake_camera_for_fallback(eligible, disable_cfg, webrtc_raises=None, webrtc_
     cam._lock.__exit__ = MagicMock(return_value=False)
     cam._local_users = set()
     cam._webrtc_session = None
+    cam._webrtc_starting = False
+    cam._stream_url = None
+    cam._dump_activities = MagicMock()
     cam.supports_sip_webrtc_streaming = MagicMock(return_value=eligible)
     cam.debug = MagicMock()
     cam._start_stream = MagicMock(return_value="rtsps://fallback.example/stream")
@@ -250,6 +254,9 @@ def _fake_camera_for_fallback(eligible, disable_cfg, webrtc_raises=None, webrtc_
             if webrtc_raises is not None:
                 raise webrtc_raises
             return webrtc_url
+
+        def stop(self):
+            pass
 
     with patch("pyaarlo.webrtc.ArloWebRtcSession", FakeSession):
         return ArloCamera._start_stream_with_webrtc_fallback(cam, "arlo")
@@ -275,3 +282,55 @@ def test_falls_back_to_rtsp_cloud_on_any_webrtc_failure():
         eligible=True, disable_cfg=False, webrtc_raises=RuntimeError("ICE failed")
     )
     assert url == "rtsps://fallback.example/stream"
+
+
+# ---------------------------------------------------------------------------
+# WebRTC stream lifetime/ref-counting.
+# ---------------------------------------------------------------------------
+
+def _fake_camera_for_stop(local_users, webrtc_session=None):
+    cam = ArloCamera.__new__(ArloCamera)
+    cam._lock = threading.Condition()
+    cam._local_users = set(local_users)
+    cam._remote_users = set()
+    cam._user_requests = set()
+    cam._webrtc_session = webrtc_session
+    cam._stream_url = "tcp://127.0.0.1:1234" if webrtc_session is not None else "rtsps://legacy"
+    cam._dump_activities = MagicMock()
+    cam._stop_activity = MagicMock()
+    return cam
+
+
+def test_stop_stream_keeps_webrtc_alive_while_other_local_users_remain():
+    session = MagicMock()
+    cam = _fake_camera_for_stop({"streaming", "snapshot"}, session)
+
+    ArloCamera._stop_stream(cam, "snapshot")
+
+    assert cam._local_users == {"streaming"}
+    assert cam._webrtc_session is session
+    assert cam._stream_url == "tcp://127.0.0.1:1234"
+    session.stop.assert_not_called()
+    cam._stop_activity.assert_not_called()
+
+
+def test_stop_stream_closes_webrtc_without_legacy_idle_when_last_user_stops():
+    session = MagicMock()
+    cam = _fake_camera_for_stop({"streaming"}, session)
+
+    ArloCamera._stop_stream(cam, "streaming")
+
+    assert cam._local_users == set()
+    assert cam._webrtc_session is None
+    assert cam._stream_url is None
+    session.stop.assert_called_once_with()
+    cam._stop_activity.assert_not_called()
+
+
+def test_stop_stream_uses_legacy_idle_for_legacy_stream_when_last_user_stops():
+    cam = _fake_camera_for_stop({"streaming"}, webrtc_session=None)
+
+    ArloCamera._stop_stream(cam, "streaming")
+
+    assert cam._local_users == set()
+    cam._stop_activity.assert_called_once_with()
