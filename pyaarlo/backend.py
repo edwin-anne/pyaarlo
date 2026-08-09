@@ -211,6 +211,7 @@ class ArloBackEnd(object):
     _web_id: str | None = None
     _sub_id: str | None = None
     _token: str | None = None
+    _token64: str | None = None
     _expires_in: int | None = None
     _needs_pairing: bool = False
 
@@ -246,11 +247,27 @@ class ArloBackEnd(object):
             self.debug("failed to log in")
             return
 
+    @staticmethod
+    def _redact_session_info(session_info):
+        if not isinstance(session_info, dict):
+            return session_info
+        redacted = {}
+        for username, values in session_info.items():
+            if not isinstance(values, dict):
+                redacted[username] = values
+                continue
+            redacted[username] = {
+                key: "***" if key in ("token", "browser_auth_code") else value
+                for key, value in values.items()
+            }
+        return redacted
+
     def _load_session(self):
         self._user_id = None
         self._web_id = None
         self._sub_id = None
         self._token = None
+        self._token64 = None
         self._expires_in = 0
         self._browser_auth_code = None
         self._user_device_id = None
@@ -274,12 +291,18 @@ class ArloBackEnd(object):
                         self._web_id = session_info["web_id"]
                         self._sub_id = session_info["sub_id"]
                         self._token = session_info["token"]
+                        self._token64 = to_b64(self._token)
                         self._expires_in = session_info["expires_in"]
                         if "browser_auth_code" in session_info:
                             self._browser_auth_code = session_info["browser_auth_code"]
                         if "device_id" in session_info:
                             self._user_device_id = session_info["device_id"]
-                        self.debug(f"loadv{version}:session_info={ArloBackEnd._session_info}")
+                        self.debug(
+                            "loadv{}:session_info={}".format(
+                                version,
+                                self._redact_session_info(ArloBackEnd._session_info),
+                            )
+                        )
                     else:
                         self.debug(f"loadv{version}:failed")
         except Exception:
@@ -304,14 +327,18 @@ class ArloBackEnd(object):
                         "device_id": self._user_device_id,
                     }
                     pickle.dump(ArloBackEnd._session_info, dump)
-                    self.debug(f"savev2:session_info={ArloBackEnd._session_info}")
+                    self.debug(
+                        "savev2:session_info={}".format(
+                            self._redact_session_info(ArloBackEnd._session_info)
+                        )
+                    )
         except Exception as e:
             self._arlo.warning("session file not written" + str(e))
 
     def _save_cookies(self, requests_cookiejar):
         if self._cookies is not None:
-            self.debug(f"saving-cookies={self._cookies}")
             self._cookies.save(ignore_discard=True)
+            self.debug("saving cookies")
 
     def _load_cookies(self):
         self._cookies = LWPCookieJar(self._arlo.cfg.cookies_file)
@@ -319,7 +346,7 @@ class ArloBackEnd(object):
             self._cookies.load()
         except:
             pass
-        self.debug(f"loading cookies={self._cookies}")
+        self.debug(f"loading {len(self._cookies)} cookies")
 
     def _transaction_id(self):
         return 'FE!' + str(uuid.uuid4())
@@ -901,7 +928,7 @@ class ArloBackEnd(object):
         self._sub_id = "subscriptions/" + self._web_id
         self._expires_in = body["expiresIn"]
         if "browserAuthCode" in body:
-            self.debug("browser auth code: {}".format(body["browserAuthCode"]))
+            self.debug("browser auth code received")
             self._browser_auth_code = body["browserAuthCode"]
 
     def _auth_headers(self):
@@ -1110,11 +1137,13 @@ class ArloBackEnd(object):
 
                 # start authentication with email
                 self.debug(
-                    "starting auth with {}".format(self._arlo.cfg.tfa_type)
+                    "starting auth with {} using default factor type".format(
+                        self._arlo.cfg.tfa_type
+                    )
                 )
                 payload = {
                     "factorId": factor_id,
-                    "factorType": "BROWSER",
+                    "factorType": "",
                     "userId": self._user_id
                 }
                 self._options = self.auth_options(AUTH_START_PATH, headers)
@@ -1149,13 +1178,16 @@ class ArloBackEnd(object):
             elif not quick_start_complete:
                 # start authentication
                 self.debug(
-                    "starting auth with {}".format(self._arlo.cfg.tfa_type)
+                    "starting auth with {} using default factor type".format(
+                        self._arlo.cfg.tfa_type
+                    )
                 )
                 payload = {
                     "factorId": factor_id,
-                    "factorType": "PUSH",
+                    "factorType": "",
                     "userId": self._user_id
                 }
+                self._options = self.auth_options(AUTH_START_PATH, headers)
                 code, body = self.auth_post(AUTH_START_PATH, payload, headers)
                 if code != 200:
                     self._arlo.error(f"login failed: start failed: {code} - {body}")
@@ -1188,7 +1220,7 @@ class ArloBackEnd(object):
 
         return AuthResult.SUCCESS
 
-    def _validate(self):
+    def _validate(self, quiet=False):
         headers = self._auth_headers()
         headers["Authorization"] = self._token64
 
@@ -1197,9 +1229,54 @@ class ArloBackEnd(object):
             AUTH_VALIDATE_PATH + "?data = {}".format(int(time.time())), {}, headers
         )
         if validated is None:
-            self._arlo.error("token validation failed")
+            if quiet:
+                self._arlo.debug("token validation failed")
+            else:
+                self._arlo.error("token validation failed")
             return False
         return True
+
+    def _has_saved_session(self):
+        return all((
+            self._user_id,
+            self._web_id,
+            self._sub_id,
+            self._token,
+            self._token64,
+            self._expires_in,
+        ))
+
+    def _reuse_saved_session(self):
+        if not self._has_saved_session():
+            return False
+
+        try:
+            expires_in = int(self._expires_in)
+        except (TypeError, ValueError):
+            self._arlo.debug("saved session has invalid expiry")
+            return False
+
+        if expires_in <= int(time.time()) + 60:
+            self._arlo.debug("saved session expired")
+            return False
+
+        self._arlo.debug("validating saved trusted session")
+        if not self._validate(quiet=True):
+            return False
+
+        self._needs_pairing = False
+        self._save_cookies(self._cookies)
+        self._arlo.debug("saved trusted session accepted")
+        return True
+
+    def _auth_or_reuse_saved_session(self):
+        if self._reuse_saved_session():
+            return AuthResult.SUCCESS
+
+        success = self._auth()
+        if success == AuthResult.SUCCESS and not (self._validate() and self._pair_auth_code()):
+            return AuthResult.FAILED
+        return success
 
     def _pair_auth_code(self):
         headers = self._auth_headers()
@@ -1219,6 +1296,7 @@ class ArloBackEnd(object):
             "factorData": "",
             "factorType": "BROWSER"
         }
+        self._options = self.auth_options(AUTH_START_PAIRING, headers)
         code, body = self.auth_post(AUTH_START_PAIRING, payload, headers, cookies=self._cookies)
         self._save_cookies(self._cookies)
 
@@ -1268,11 +1346,9 @@ class ArloBackEnd(object):
         success = AuthResult.FAILED
         if self._arlo.cfg.http_backend == "curl_cffi":
             self._create_session()
-            success = self._auth()
+            success = self._auth_or_reuse_saved_session()
             if success == AuthResult.FAILED:
                 return False
-            if success == AuthResult.SUCCESS and not (self._validate() and self._pair_auth_code()):
-                success = AuthResult.FAILED
         else:
             for curve in self._arlo.cfg.ecdh_curves:
                 self.debug(f"CloudFlare curve set to: {curve}")
@@ -1280,10 +1356,10 @@ class ArloBackEnd(object):
 
                 # Try to authenticate. We retry if it was a cloud flare
                 # error or we failed to get the 2FA code.
-                success = self._auth()
+                success = self._auth_or_reuse_saved_session()
                 if success == AuthResult.FAILED:
                     return False
-                if success == AuthResult.SUCCESS and self._validate() and self._pair_auth_code():
+                if success == AuthResult.SUCCESS:
                     break
                 success = AuthResult.FAILED
                 self.debug("login failed, trying another ecdh_curve")
