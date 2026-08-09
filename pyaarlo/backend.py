@@ -80,8 +80,9 @@ def _auth_helper_headers(user_device_id, user_agent, send_source=False):
         "Pragma": "no-cache",
         "Priority": "u=1, i",
         "Referer": REFERER_HOST,
+        "source": "arloCamWeb",
         "User-Agent": _resolve_user_agent(user_agent),
-        "X-Service-Version": "3",
+        "x-service-version": "v3",
         "X-User-Device-Automation-Name": "QlJPV1NFUg==",
         "X-User-Device-Id": user_device_id,
         "X-User-Device-Type": "BROWSER",
@@ -949,8 +950,9 @@ class ArloBackEnd(object):
             # "Sec-Fetch-Dest": "empty",
             # "Sec-Fetch-Mode": "cors",
             # "Sec-Fetch-Site": "same-site",
+            "source": "arloCamWeb",
             "User-Agent": self._user_agent,
-            "X-Service-Version": "3",
+            "x-service-version": "v3",
             "X-User-Device-Automation-Name": "QlJPV1NFUg==",
             "X-User-Device-Id": self._user_device_id,
             "X-User-Device-Type": "BROWSER",
@@ -963,6 +965,60 @@ class ArloBackEnd(object):
             })
 
         return headers
+
+    def _select_tfa_factor(self, factors):
+        factors_of_type = []
+
+        for factor in factors or []:
+            if (
+                self._arlo.cfg.tfa_factor_id
+                and factor.get("factorId") == self._arlo.cfg.tfa_factor_id
+            ):
+                return factor
+            if str(factor.get("factorType", "")).lower() == self._arlo.cfg.tfa_type:
+                factors_of_type.append(factor)
+
+        for factor in factors_of_type:
+            nicknames = (
+                factor.get("factorNickname"),
+                factor.get("displayName"),
+            )
+            if self._arlo.cfg.tfa_nickname in nicknames:
+                return factor
+
+        if factors_of_type:
+            return factors_of_type[0]
+
+        return None
+
+    def _get_secondary_factors(self, headers):
+        factors = self.auth_get(
+            AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
+        )
+        if not isinstance(factors, dict):
+            return None
+        return factors.get("items", [])
+
+    def _start_pingone_auth(self, headers):
+        self.debug("starting PingOne auth discovery")
+        payload = {
+            "factorType": "",
+            "userId": self._user_id
+        }
+        self._options = self.auth_options(AUTH_START_PATH, headers)
+        code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+        if code != 200 or not isinstance(body, dict):
+            self.debug(f"PingOne auth discovery failed: {code} - {body}")
+            return None, None
+
+        factor = self._select_tfa_factor(body.get("factors", []))
+        if factor is None:
+            self.debug("PingOne auth discovery returned no matching factor")
+            return None, None
+
+        factor_type = str(factor.get("factorType", "")).lower()
+        self.debug(f"PingOne auth selected {factor_type}")
+        return factor.get("factorId"), body.get("factorAuthCode")
 
     def _headers(self):
         return {
@@ -1039,8 +1095,8 @@ class ArloBackEnd(object):
 
             # look for code source choice
             self.debug(f"looking for {self._arlo.cfg.tfa_type}/{self._arlo.cfg.tfa_nickname}")
-            factors_of_type = []
             factor_id = None
+            factor_auth_code = None
 
             payload = {
                 "factorType": "BROWSER",
@@ -1057,36 +1113,24 @@ class ArloBackEnd(object):
                 factor_id = body["factorId"]
             else:
                 self._needs_pairing = True
-                factors = self.auth_get(
-                    AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
-                )
+                factor_id, factor_auth_code = self._start_pingone_auth(headers)
+
+            if factor_id is None:
+                factors = self._get_secondary_factors(headers)
                 if factors is None:
                     self._arlo.error("login failed: 2fa: no secondary choices available")
                     return AuthResult.FAILED
 
-                for factor in factors["items"]:
-                    if factor["factorId"] == self._arlo.cfg.tfa_factor_id:
-                        factor_id = factor["factorId"]
-                        break
-                    if factor["factorType"].lower() == self._arlo.cfg.tfa_type:
-                        factors_of_type.append(factor)
-
-                if factor_id is None and len(factors_of_type) > 0:
-                    # Try to match the factorNickname with the tfa_nickname
-                    for factor in factors_of_type:
-                        if self._arlo.cfg.tfa_nickname == factor["factorNickname"]:
-                            factor_id = factor["factorId"]
-                            break
-                    # Otherwise fallback to using the first option
-                    else:
-                        factor_id = factors_of_type[0]["factorId"]
+                factor = self._select_tfa_factor(factors)
+                if factor is not None:
+                    factor_id = factor.get("factorId")
 
             if factor_id is None:
                 self._arlo.error("login failed: 2fa: no secondary choices available")
                 return AuthResult.FAILED
 
             quick_start_complete = False
-            if code == 200:
+            if code == 200 and factor_auth_code is None:
                 payload = {
                     "factorId": factor_id,
                     "factorType": "BROWSER",
@@ -1102,28 +1146,19 @@ class ArloBackEnd(object):
                     )
                     self._needs_pairing = True
                     factor_id = None
-                    factors_of_type = []
-                    factors = self.auth_get(
-                        AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
-                    )
-                    if factors is None:
-                        self._arlo.error("login failed: 2fa: no secondary choices available")
-                        return AuthResult.FAILED
+                    factor_auth_code = None
 
-                    for factor in factors["items"]:
-                        if factor["factorId"] == self._arlo.cfg.tfa_factor_id:
-                            factor_id = factor["factorId"]
-                            break
-                        if factor["factorType"].lower() == self._arlo.cfg.tfa_type:
-                            factors_of_type.append(factor)
+                    factor_id, factor_auth_code = self._start_pingone_auth(headers)
 
-                    if factor_id is None and len(factors_of_type) > 0:
-                        for factor in factors_of_type:
-                            if self._arlo.cfg.tfa_nickname == factor["factorNickname"]:
-                                factor_id = factor["factorId"]
-                                break
-                        else:
-                            factor_id = factors_of_type[0]["factorId"]
+                    if factor_id is None:
+                        factors = self._get_secondary_factors(headers)
+                        if factors is None:
+                            self._arlo.error("login failed: 2fa: no secondary choices available")
+                            return AuthResult.FAILED
+
+                        factor = self._select_tfa_factor(factors)
+                        if factor is not None:
+                            factor_id = factor.get("factorId")
 
                     if factor_id is None:
                         self._arlo.error("login failed: 2fa: no secondary choices available")
@@ -1146,12 +1181,15 @@ class ArloBackEnd(object):
                     "factorType": "",
                     "userId": self._user_id
                 }
-                self._options = self.auth_options(AUTH_START_PATH, headers)
-                code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-                if code != 200:
-                    self._arlo.error(f"login failed: start failed: {code} - {body}")
-                    return AuthResult.CAN_RETRY
-                factor_auth_code = body["factorAuthCode"]
+                if factor_auth_code is None:
+                    self._options = self.auth_options(AUTH_START_PATH, headers)
+                    code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+                    if code != 200:
+                        self._arlo.error(f"login failed: start failed: {code} - {body}")
+                        return AuthResult.CAN_RETRY
+                    factor_auth_code = body["factorAuthCode"]
+                else:
+                    self.debug("using PingOne factor auth code")
 
                 # get code from TFA source
                 code = tfa.get()
@@ -1187,12 +1225,15 @@ class ArloBackEnd(object):
                     "factorType": "",
                     "userId": self._user_id
                 }
-                self._options = self.auth_options(AUTH_START_PATH, headers)
-                code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-                if code != 200:
-                    self._arlo.error(f"login failed: start failed: {code} - {body}")
-                    return AuthResult.FAILED
-                factor_auth_code = body["factorAuthCode"]
+                if factor_auth_code is None:
+                    self._options = self.auth_options(AUTH_START_PATH, headers)
+                    code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+                    if code != 200:
+                        self._arlo.error(f"login failed: start failed: {code} - {body}")
+                        return AuthResult.FAILED
+                    factor_auth_code = body["factorAuthCode"]
+                else:
+                    self.debug("using PingOne factor auth code")
                 tries = 1
                 while True:
                     # finish authentication
