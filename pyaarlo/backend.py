@@ -26,6 +26,7 @@ from .constant import (
     AUTH_START_PAIRING,
     AUTH_START_PATH,
     AUTH_VALIDATE_PATH,
+    DEFAULT_AUTH_HOST,
     DEFAULT_RESOURCES,
     DEVICES_PATH,
     LOGOUT_PATH,
@@ -53,6 +54,149 @@ class AuthResult(IntEnum):
     CAN_RETRY = -1,
     SUCCESS = 0,
     FAILED = 1
+
+
+class ArloAuthError(Exception):
+    """Raised when an Arlo authentication helper call fails."""
+
+
+def _resolve_user_agent(agent):
+    if agent.startswith("!"):
+        return agent[1:]
+    agent = agent.lower()
+    if agent == "random":
+        return _resolve_user_agent(random.choice(list(USER_AGENTS.keys())))
+    return USER_AGENTS.get(agent, USER_AGENTS["linux"])
+
+
+def _auth_helper_headers(user_device_id, user_agent, send_source=False):
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-GB,en;q=0.9,en-US;q=0.8",
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json",
+        "Origin": ORIGIN_HOST,
+        "Pragma": "no-cache",
+        "Priority": "u=1, i",
+        "Referer": REFERER_HOST,
+        "User-Agent": _resolve_user_agent(user_agent),
+        "X-Service-Version": "3",
+        "X-User-Device-Automation-Name": "QlJPV1NFUg==",
+        "X-User-Device-Id": user_device_id,
+        "X-User-Device-Type": "BROWSER",
+    }
+    if send_source:
+        headers["Source"] = "arloCamWeb"
+    return headers
+
+
+def _create_auth_helper_session(http_backend, curl_cffi_impersonate):
+    if http_backend == "curl_cffi":
+        from curl_cffi import requests as cffi_requests
+        return cffi_requests.Session(impersonate=curl_cffi_impersonate)
+
+    import cloudscraper
+    return cloudscraper.create_scraper(
+        disableCloudflareV1=True,
+        ecdhCurve="secp384r1",
+        debug=False,
+    )
+
+
+def _parse_auth_helper_response(response):
+    try:
+        body = response.json()
+    except Exception:
+        body = response.text
+
+    if response.status_code != 200:
+        return response.status_code, None
+
+    if isinstance(body, dict) and "meta" in body:
+        if body["meta"]["code"] == 200:
+            return 200, body["data"]
+        return int(body["meta"]["code"]), body["meta"].get("message")
+
+    return 500, None
+
+
+def _auth_helper_request(session, method, url, params=None, headers=None, timeout=60):
+    try:
+        if method == "OPTIONS":
+            session.options(url, json=params, headers=headers, timeout=timeout)
+            return 200, None
+        if method == "GET":
+            response = session.get(url, headers=headers, timeout=timeout)
+        else:
+            response = session.post(url, json=params, headers=headers, timeout=timeout)
+    except Exception as err:
+        raise ArloAuthError(f"request failed: {type(err).__name__}") from err
+
+    return _parse_auth_helper_response(response)
+
+
+def get_available_2fa_factors(
+        username,
+        password,
+        auth_host=DEFAULT_AUTH_HOST,
+        http_backend="curl_cffi",
+        curl_cffi_impersonate="chrome131",
+        user_agent="linux",
+        request_timeout=60,
+        send_source=False,
+):
+    """Authenticate enough to return the account's available 2FA factors."""
+    user_device_id = str(uuid.uuid4())
+    session = _create_auth_helper_session(http_backend, curl_cffi_impersonate)
+    headers = _auth_helper_headers(user_device_id, user_agent, send_source)
+
+    _auth_helper_request(
+        session, "OPTIONS", auth_host + AUTH_PATH, headers=headers, timeout=request_timeout
+    )
+    code, body = _auth_helper_request(
+        session,
+        "POST",
+        auth_host + AUTH_PATH,
+        {
+            "email": username,
+            "password": to_b64(password),
+            "language": "en",
+            "EnvSource": "prod",
+        },
+        headers,
+        request_timeout,
+    )
+
+    if code == 429:
+        raise ArloAuthError("429 - possible cloudflare issue")
+    if code != 200 or body is None:
+        raise ArloAuthError(f"{code} - {body}")
+    if body.get("authCompleted", False):
+        return []
+
+    token = body.get("accessToken", body)["token"]
+    headers["Authorization"] = to_b64(token)
+
+    factors_url = auth_host + AUTH_GET_FACTORS + "?data = {}".format(int(time.time()))
+    _auth_helper_request(
+        session, "OPTIONS", auth_host + AUTH_GET_FACTORS, headers=headers, timeout=request_timeout
+    )
+    code, factors = _auth_helper_request(
+        session, "GET", factors_url, headers=headers, timeout=request_timeout
+    )
+    if code != 200 or factors is None:
+        raise ArloAuthError(f"2fa factors failed: {code} - {factors}")
+
+    return [
+        {
+            "factor_id": factor.get("factorId"),
+            "factor_type": str(factor.get("factorType", "")).lower(),
+            "factor_nickname": factor.get("factorNickname", ""),
+        }
+        for factor in factors.get("items", [])
+        if factor.get("factorId") and factor.get("factorType")
+    ]
 
 
 # include token and session details
@@ -894,10 +1038,13 @@ class ArloBackEnd(object):
                     return AuthResult.FAILED
 
                 for factor in factors["items"]:
+                    if factor["factorId"] == self._arlo.cfg.tfa_factor_id:
+                        factor_id = factor["factorId"]
+                        break
                     if factor["factorType"].lower() == self._arlo.cfg.tfa_type:
                         factors_of_type.append(factor)
 
-                if len(factors_of_type) > 0:
+                if factor_id is None and len(factors_of_type) > 0:
                     # Try to match the factorNickname with the tfa_nickname
                     for factor in factors_of_type:
                         if self._arlo.cfg.tfa_nickname == factor["factorNickname"]:
@@ -920,8 +1067,36 @@ class ArloBackEnd(object):
                 self._options = self.auth_options(AUTH_START_PATH, headers)
                 code, body = self.auth_post(AUTH_START_PATH, payload, headers)
                 if code != 200:
-                    self._arlo.error(f"login failed: quick start failed: {code} - {body}")
-                    return AuthResult.FAILED
+                    self._arlo.warning(
+                        f"quick start failed: {code} - {body}; trying configured 2FA"
+                    )
+                    self._needs_pairing = True
+                    factor_id = None
+                    factors = self.auth_get(
+                        AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
+                    )
+                    if factors is None:
+                        self._arlo.error("login failed: 2fa: no secondary choices available")
+                        return AuthResult.FAILED
+
+                    for factor in factors["items"]:
+                        if factor["factorId"] == self._arlo.cfg.tfa_factor_id:
+                            factor_id = factor["factorId"]
+                            break
+                        if factor["factorType"].lower() == self._arlo.cfg.tfa_type:
+                            factors_of_type.append(factor)
+
+                    if factor_id is None and len(factors_of_type) > 0:
+                        for factor in factors_of_type:
+                            if self._arlo.cfg.tfa_nickname == factor["factorNickname"]:
+                                factor_id = factor["factorId"]
+                                break
+                        else:
+                            factor_id = factors_of_type[0]["factorId"]
+
+                    if factor_id is None:
+                        self._arlo.error("login failed: 2fa: no secondary choices available")
+                        return AuthResult.FAILED
 
             elif tfa != TFA_PUSH_SOURCE:
                 # snapshot 2fa before sending in request
