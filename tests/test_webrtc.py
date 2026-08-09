@@ -14,6 +14,7 @@ import pytest
 
 from pyaarlo.camera import ArloCamera, _get_model_capabilities, _model_capabilities_cache
 from pyaarlo.webrtc import (
+    ArloWebRtcSession,
     _build_ice_servers,
     _http_over_ws_message,
     _parse_http_over_ws_message,
@@ -334,3 +335,34 @@ def test_stop_stream_uses_legacy_idle_for_legacy_stream_when_last_user_stops():
 
     assert cam._local_users == set()
     cam._stop_activity.assert_called_once_with()
+
+
+def test_webrtc_mpegts_recorder_muxes_video_only(monkeypatch):
+    session = ArloWebRtcSession.__new__(ArloWebRtcSession)
+    session._camera = SimpleNamespace(debug=MagicMock())
+    session._recorder = MagicMock()
+    session._recorder_started = False
+    session._recorder_track_ids = set()
+    session._discard_track_ids = set()
+    session._discard_track_tasks = set()
+    session._video_debug_track = None
+
+    fake_discard_task = MagicMock()
+    fake_discard_task.add_done_callback = MagicMock()
+
+    def fake_ensure_future(coro):
+        coro.close()
+        return fake_discard_task
+
+    monkeypatch.setattr("pyaarlo.webrtc.asyncio.ensure_future", fake_ensure_future)
+
+    audio_track = SimpleNamespace(kind="audio")
+    video_track = SimpleNamespace(kind="video")
+
+    ArloWebRtcSession._add_recorder_track(session, audio_track)
+    session._recorder.addTrack.assert_not_called()
+    assert id(audio_track) in session._discard_track_ids
+
+    ArloWebRtcSession._add_recorder_track(session, video_track)
+    session._recorder.addTrack.assert_called_once()
+    assert session._video_debug_track is not None

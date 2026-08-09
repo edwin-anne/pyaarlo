@@ -1265,6 +1265,8 @@ class ArloWebRtcSession:
         self._recorder_starting = False
         self._tracks = []
         self._recorder_track_ids = set()
+        self._discard_track_ids = set()
+        self._discard_track_tasks = set()
         self._recorder_debug_tasks = set()
         self._stats_task = None
         self._video_track_ready = None
@@ -1557,9 +1559,11 @@ class ArloWebRtcSession:
         if track_id in self._recorder_track_ids:
             return
         self._recorder_track_ids.add(track_id)
+        if track.kind != "video":
+            self._discard_unmuxed_track(track)
+            return
         wrapped = _DebugMediaTrack(self._camera, track)
-        if wrapped.kind == "video":
-            self._video_debug_track = wrapped
+        self._video_debug_track = wrapped
         self._recorder.addTrack(wrapped)
         self._camera.debug("SIP/WebRTC recorder added {} track".format(track.kind))
         if self._recorder_started:
@@ -1578,6 +1582,39 @@ class ArloWebRtcSession:
             self._camera.debug(
                 "SIP/WebRTC could not attach late recorder track ({})".format(e)
             )
+
+    def _discard_unmuxed_track(self, track):
+        track_id = id(track)
+        if track_id in self._discard_track_ids:
+            return
+        self._discard_track_ids.add(track_id)
+        task = asyncio.ensure_future(self._async_discard_track(track))
+        self._discard_track_tasks.add(task)
+        task.add_done_callback(self._discard_track_done)
+        self._camera.debug(
+            "SIP/WebRTC consuming {} track without muxing it to Home Assistant".format(
+                track.kind
+            )
+        )
+
+    async def _async_discard_track(self, track):
+        wrapped = _DebugMediaTrack(self._camera, track)
+        try:
+            while True:
+                await wrapped.recv()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _discard_track_done(self, task):
+        self._discard_track_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            pass
 
     async def _async_start_recorder(self):
         if self._recorder_started or self._recorder_starting:
@@ -2134,6 +2171,9 @@ class ArloWebRtcSession:
                 await self._recorder.stop()
             except Exception:
                 pass
+        for task in list(self._discard_track_tasks):
+            task.cancel()
+        self._discard_track_tasks.clear()
         if self._stats_task is not None:
             self._stats_task.cancel()
             self._stats_task = None
