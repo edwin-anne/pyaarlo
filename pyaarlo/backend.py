@@ -80,6 +80,12 @@ def _auth_helper_headers(user_device_id, user_agent, send_source=False):
         "Pragma": "no-cache",
         "Priority": "u=1, i",
         "Referer": REFERER_HOST,
+        "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Linux"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
         "source": "arloCamWeb",
         "User-Agent": _resolve_user_agent(user_agent),
         "x-service-version": "v3",
@@ -950,6 +956,12 @@ class ArloBackEnd(object):
             # "Sec-Fetch-Dest": "empty",
             # "Sec-Fetch-Mode": "cors",
             # "Sec-Fetch-Site": "same-site",
+            "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Linux"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
             "source": "arloCamWeb",
             "User-Agent": self._user_agent,
             "x-service-version": "v3",
@@ -991,6 +1003,20 @@ class ArloBackEnd(object):
 
         return None
 
+    def _log_selected_tfa_factor(self, factor):
+        if not isinstance(factor, dict):
+            return
+        factor_id = str(factor.get("factorId", ""))
+        safe_id = factor_id[-8:] if factor_id else ""
+        self.debug(
+            "selected 2FA factor type={}, role={}, nickname={}, id_suffix={}".format(
+                factor.get("factorType"),
+                factor.get("factorRole"),
+                factor.get("factorNickname") or factor.get("displayName"),
+                safe_id,
+            )
+        )
+
     def _get_secondary_factors(self, headers):
         factors = self.auth_get(
             AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
@@ -1016,6 +1042,7 @@ class ArloBackEnd(object):
             self.debug("PingOne auth discovery returned no matching factor")
             return None, None
 
+        self._log_selected_tfa_factor(factor)
         factor_type = str(factor.get("factorType", "")).lower()
         self.debug(f"PingOne auth selected {factor_type}")
         return factor.get("factorId"), body.get("factorAuthCode")
@@ -1123,6 +1150,7 @@ class ArloBackEnd(object):
 
                 factor = self._select_tfa_factor(factors)
                 if factor is not None:
+                    self._log_selected_tfa_factor(factor)
                     factor_id = factor.get("factorId")
 
             if factor_id is None:
@@ -1158,6 +1186,7 @@ class ArloBackEnd(object):
 
                         factor = self._select_tfa_factor(factors)
                         if factor is not None:
+                            self._log_selected_tfa_factor(factor)
                             factor_id = factor.get("factorId")
 
                     if factor_id is None:
