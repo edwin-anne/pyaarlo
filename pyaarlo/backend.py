@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import pprint
 import re
@@ -58,6 +59,20 @@ class AuthResult(IntEnum):
 
 class ArloAuthError(Exception):
     """Raised when an Arlo authentication helper call fails."""
+
+
+class ArloManualAuthSession:
+    """State for an interactive 2FA login started from a config flow."""
+
+    def __init__(self, session, headers, username, user_id, token, expires_in, device_id, factor_auth_code):
+        self.session = session
+        self.headers = headers
+        self.username = username
+        self.user_id = user_id
+        self.token = token
+        self.expires_in = expires_in
+        self.device_id = device_id
+        self.factor_auth_code = factor_auth_code
 
 
 def _resolve_user_agent(agent):
@@ -215,6 +230,169 @@ def get_available_2fa_factors(
         for factor in factors.get("items", [])
         if factor.get("factorId") and factor.get("factorType")
     ]
+
+
+def start_interactive_2fa_auth(
+        username,
+        password,
+        factor_id,
+        factor_type,
+        auth_host=DEFAULT_AUTH_HOST,
+        http_backend="curl_cffi",
+        curl_cffi_impersonate="chrome131",
+        user_agent="linux",
+        request_timeout=60,
+        send_source=False,
+):
+    """Start an interactive 2FA auth and return state for OTP completion."""
+    user_device_id = str(uuid.uuid4())
+    session = _create_auth_helper_session(http_backend, curl_cffi_impersonate)
+    headers = _auth_helper_headers(user_device_id, user_agent, send_source)
+    headers["Auth-Version"] = "2"
+
+    _auth_helper_request(
+        session, "OPTIONS", auth_host + AUTH_PATH, headers=headers, timeout=request_timeout
+    )
+    code, body = _auth_helper_request(
+        session,
+        "POST",
+        auth_host + AUTH_PATH,
+        {
+            "email": username,
+            "password": to_b64(password),
+            "language": "fr",
+            "EnvSource": "prod",
+        },
+        headers,
+        request_timeout,
+    )
+    if code != 200 or body is None:
+        raise ArloAuthError(f"{code} - {body}")
+    if body.get("authCompleted", False):
+        token_body = body.get("accessToken", body)
+        return ArloManualAuthSession(
+            session,
+            headers,
+            username,
+            token_body["userId"],
+            token_body["token"],
+            token_body["expiresIn"],
+            user_device_id,
+            None,
+        )
+
+    token_body = body.get("accessToken", body)
+    headers["Authorization"] = to_b64(token_body["token"])
+
+    attempts = [
+        {"factorId": factor_id, "factorType": "", "userId": token_body["userId"]},
+        {"factorId": factor_id, "factorType": str(factor_type or "").upper(), "userId": token_body["userId"]},
+        {"factorId": factor_id, "userId": token_body["userId"]},
+    ]
+    last_code = 500
+    last_body = None
+    for payload in attempts:
+        _auth_helper_request(
+            session, "OPTIONS", auth_host + AUTH_START_PATH, headers=headers, timeout=request_timeout
+        )
+        last_code, last_body = _auth_helper_request(
+            session, "POST", auth_host + AUTH_START_PATH, payload, headers, request_timeout
+        )
+        if last_code == 200 and isinstance(last_body, dict):
+            return ArloManualAuthSession(
+                session,
+                headers,
+                username,
+                token_body["userId"],
+                token_body["token"],
+                token_body["expiresIn"],
+                user_device_id,
+                last_body["factorAuthCode"],
+            )
+
+    raise ArloAuthError(f"start failed: {last_code} - {last_body}")
+
+
+def finish_interactive_2fa_auth(
+        auth_session,
+        otp,
+        storage_dir,
+        auth_host=DEFAULT_AUTH_HOST,
+        request_timeout=60,
+):
+    """Finish interactive 2FA auth and save a pyaarlo-compatible session."""
+    headers = auth_session.headers
+    _auth_helper_request(
+        auth_session.session,
+        "OPTIONS",
+        auth_host + AUTH_FINISH_PATH,
+        headers=headers,
+        timeout=request_timeout,
+    )
+    code, body = _auth_helper_request(
+        auth_session.session,
+        "POST",
+        auth_host + AUTH_FINISH_PATH,
+        {
+            "factorAuthCode": auth_session.factor_auth_code,
+            "otp": otp,
+            "isBrowserTrusted": True,
+        },
+        headers,
+        request_timeout,
+    )
+    if code != 200 or not isinstance(body, dict):
+        raise ArloAuthError(f"finish failed: {code} - {body}")
+
+    token_body = body.get("accessToken", body)
+    browser_auth_code = body.get("browserAuthCode")
+    headers["Authorization"] = to_b64(token_body["token"])
+
+    if browser_auth_code:
+        _auth_helper_request(
+            auth_session.session,
+            "OPTIONS",
+            auth_host + AUTH_START_PAIRING,
+            headers=headers,
+            timeout=request_timeout,
+        )
+        _auth_helper_request(
+            auth_session.session,
+            "POST",
+            auth_host + AUTH_START_PAIRING,
+            {
+                "factorAuthCode": browser_auth_code,
+                "factorData": "",
+                "factorType": "BROWSER",
+            },
+            headers,
+            request_timeout,
+        )
+
+    os.makedirs(storage_dir, exist_ok=True)
+    session_file = os.path.join(storage_dir, "session.pickle")
+    try:
+        with open(session_file, "rb") as dump:
+            session_info = pickle.load(dump)
+            if session_info.get("version") != "2":
+                session_info = {"version": "2", auth_session.username: session_info}
+    except Exception:
+        session_info = {"version": "2"}
+
+    user_id = token_body["userId"]
+    session_info[auth_session.username] = {
+        "user_id": user_id,
+        "web_id": f"{user_id}_web",
+        "sub_id": f"subscriptions/{user_id}_web",
+        "token": token_body["token"],
+        "expires_in": token_body["expiresIn"],
+        "browser_auth_code": browser_auth_code,
+        "device_id": auth_session.device_id,
+    }
+    with open(session_file, "wb") as dump:
+        pickle.dump(session_info, dump)
+
+    return True
 
 
 # include token and session details
@@ -1038,19 +1216,12 @@ class ArloBackEnd(object):
 
     def _start_pingone_auth(self, headers):
         self.debug("starting PingOne auth discovery")
-        attempts = (
-            ("default factor type", {"factorType": "", "userId": self._user_id}),
-            ("without factor type", {"userId": self._user_id}),
+        self._options = self.auth_options(AUTH_START_PATH, headers)
+        code, body = self.auth_post(
+            AUTH_START_PATH, {"factorType": "", "userId": self._user_id}, headers
         )
-        body = None
-        for label, payload in attempts:
-            self.debug(f"starting PingOne auth discovery {label}")
-            self._options = self.auth_options(AUTH_START_PATH, headers)
-            code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-            if code == 200 and isinstance(body, dict):
-                break
-            self.debug(f"PingOne auth discovery {label} failed: {code} - {body}")
-        else:
+        if code != 200 or not isinstance(body, dict):
+            self.debug(f"PingOne auth discovery failed: {code} - {body}")
             return None, None
 
         factor = self._select_tfa_factor(body.get("factors", []))
@@ -1064,31 +1235,13 @@ class ArloBackEnd(object):
         return factor.get("factorId"), body.get("factorAuthCode")
 
     def _start_factor_auth(self, headers, factor_id, factor_type):
-        normalized_type = str(factor_type or "").upper()
-        attempts = [
-            ("default factor type", {"factorId": factor_id, "factorType": "", "userId": self._user_id}),
-        ]
-        if normalized_type:
-            attempts.append((
-                f"explicit {normalized_type} factor type",
-                {"factorId": factor_id, "factorType": normalized_type, "userId": self._user_id},
-            ))
-        attempts.append((
-            "without factor type",
-            {"factorId": factor_id, "userId": self._user_id},
-        ))
-
-        last_code = 500
-        last_body = None
-        for label, payload in attempts:
-            self.debug(f"starting auth with {factor_type} using {label}")
-            self._options = self.auth_options(AUTH_START_PATH, headers)
-            last_code, last_body = self.auth_post(AUTH_START_PATH, payload, headers)
-            if last_code == 200:
-                return last_code, last_body
-            self.debug(f"startAuth {label} failed: {last_code} - {last_body}")
-
-        return last_code, last_body
+        self.debug(f"starting auth with {factor_type}")
+        self._options = self.auth_options(AUTH_START_PATH, headers)
+        return self.auth_post(
+            AUTH_START_PATH,
+            {"factorId": factor_id, "factorType": "", "userId": self._user_id},
+            headers,
+        )
 
     def _headers(self):
         return {
@@ -1157,6 +1310,9 @@ class ArloBackEnd(object):
             # update headers and create 2fa instance
             headers["Authorization"] = self._token64
             tfa = self._get_tfa()
+            if tfa == "manual":
+                self._arlo.error("login failed: manual 2fa requires config flow reauth")
+                return AuthResult.FAILED
 
             # get available 2fa choices,
             self.debug("getting tfa choices")
