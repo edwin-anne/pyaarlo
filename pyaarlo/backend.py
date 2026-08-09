@@ -101,6 +101,11 @@ def _auth_helper_headers(user_device_id, user_agent, send_source=False):
 def _create_auth_helper_session(http_backend, curl_cffi_impersonate):
     if http_backend == "curl_cffi":
         from curl_cffi import requests as cffi_requests
+        for impersonate in _curl_cffi_impersonations(curl_cffi_impersonate):
+            try:
+                return cffi_requests.Session(impersonate=impersonate)
+            except Exception:
+                continue
         return cffi_requests.Session(impersonate=curl_cffi_impersonate)
 
     import cloudscraper
@@ -109,6 +114,12 @@ def _create_auth_helper_session(http_backend, curl_cffi_impersonate):
         ecdhCurve="secp384r1",
         debug=False,
     )
+
+
+def _curl_cffi_impersonations(configured):
+    if configured == "chrome131":
+        return ("chrome", "chrome136", "chrome133", "chrome131")
+    return (configured,)
 
 
 def _parse_auth_helper_response(response):
@@ -1027,14 +1038,19 @@ class ArloBackEnd(object):
 
     def _start_pingone_auth(self, headers):
         self.debug("starting PingOne auth discovery")
-        payload = {
-            "factorType": "",
-            "userId": self._user_id
-        }
-        self._options = self.auth_options(AUTH_START_PATH, headers)
-        code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-        if code != 200 or not isinstance(body, dict):
-            self.debug(f"PingOne auth discovery failed: {code} - {body}")
+        attempts = (
+            ("default factor type", {"factorType": "", "userId": self._user_id}),
+            ("without factor type", {"userId": self._user_id}),
+        )
+        body = None
+        for label, payload in attempts:
+            self.debug(f"starting PingOne auth discovery {label}")
+            self._options = self.auth_options(AUTH_START_PATH, headers)
+            code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+            if code == 200 and isinstance(body, dict):
+                break
+            self.debug(f"PingOne auth discovery {label} failed: {code} - {body}")
+        else:
             return None, None
 
         factor = self._select_tfa_factor(body.get("factors", []))
@@ -1046,6 +1062,33 @@ class ArloBackEnd(object):
         factor_type = str(factor.get("factorType", "")).lower()
         self.debug(f"PingOne auth selected {factor_type}")
         return factor.get("factorId"), body.get("factorAuthCode")
+
+    def _start_factor_auth(self, headers, factor_id, factor_type):
+        normalized_type = str(factor_type or "").upper()
+        attempts = [
+            ("default factor type", {"factorId": factor_id, "factorType": "", "userId": self._user_id}),
+        ]
+        if normalized_type:
+            attempts.append((
+                f"explicit {normalized_type} factor type",
+                {"factorId": factor_id, "factorType": normalized_type, "userId": self._user_id},
+            ))
+        attempts.append((
+            "without factor type",
+            {"factorId": factor_id, "userId": self._user_id},
+        ))
+
+        last_code = 500
+        last_body = None
+        for label, payload in attempts:
+            self.debug(f"starting auth with {factor_type} using {label}")
+            self._options = self.auth_options(AUTH_START_PATH, headers)
+            last_code, last_body = self.auth_post(AUTH_START_PATH, payload, headers)
+            if last_code == 200:
+                return last_code, last_body
+            self.debug(f"startAuth {label} failed: {last_code} - {last_body}")
+
+        return last_code, last_body
 
     def _headers(self):
         return {
@@ -1211,8 +1254,9 @@ class ArloBackEnd(object):
                     "userId": self._user_id
                 }
                 if factor_auth_code is None:
-                    self._options = self.auth_options(AUTH_START_PATH, headers)
-                    code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+                    code, body = self._start_factor_auth(
+                        headers, factor_id, self._arlo.cfg.tfa_type
+                    )
                     if code != 200:
                         self._arlo.error(f"login failed: start failed: {code} - {body}")
                         return AuthResult.CAN_RETRY
@@ -1255,8 +1299,9 @@ class ArloBackEnd(object):
                     "userId": self._user_id
                 }
                 if factor_auth_code is None:
-                    self._options = self.auth_options(AUTH_START_PATH, headers)
-                    code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+                    code, body = self._start_factor_auth(
+                        headers, factor_id, self._arlo.cfg.tfa_type
+                    )
                     if code != 200:
                         self._arlo.error(f"login failed: start failed: {code} - {body}")
                         return AuthResult.FAILED
@@ -1395,7 +1440,16 @@ class ArloBackEnd(object):
         """Create the HTTP session using the configured backend."""
         if self._arlo.cfg.http_backend == "curl_cffi":
             from curl_cffi import requests as cffi_requests
-            self._session = cffi_requests.Session(impersonate=self._arlo.cfg.curl_cffi_impersonate)
+            for impersonate in _curl_cffi_impersonations(self._arlo.cfg.curl_cffi_impersonate):
+                try:
+                    self._session = cffi_requests.Session(impersonate=impersonate)
+                    self.debug(f"curl_cffi impersonate={impersonate}")
+                    break
+                except Exception:
+                    continue
+            else:
+                self._session = cffi_requests.Session(impersonate=self._arlo.cfg.curl_cffi_impersonate)
+                self.debug(f"curl_cffi impersonate={self._arlo.cfg.curl_cffi_impersonate}")
         else:
             import cloudscraper
             self._session = cloudscraper.create_scraper(
