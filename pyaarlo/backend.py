@@ -1153,7 +1153,7 @@ class ArloBackEnd(object):
                 )
                 payload = {
                     "factorId": factor_id,
-                    "factorType": "",
+                    "factorType": "PUSH",
                     "userId": self._user_id
                 }
                 code, body = self.auth_post(AUTH_START_PATH, payload, headers)
