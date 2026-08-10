@@ -356,7 +356,7 @@ def finish_interactive_2fa_auth(
             headers=headers,
             timeout=request_timeout,
         )
-        _auth_helper_request(
+        code, body = _auth_helper_request(
             auth_session.session,
             "POST",
             auth_host + AUTH_START_PAIRING,
@@ -368,6 +368,8 @@ def finish_interactive_2fa_auth(
             headers,
             request_timeout,
         )
+        if code != 200:
+            raise ArloAuthError(f"pairing failed: {code} - {body}")
 
     os.makedirs(storage_dir, exist_ok=True)
     session_file = os.path.join(storage_dir, "session.pickle")
@@ -1495,15 +1497,17 @@ class ArloBackEnd(object):
         headers = self._auth_headers()
         headers["Authorization"] = self._token64
 
-        # Validate it!
-        validated = self.auth_get(
+        # Validate it! Check the code as well as the body; a failed validation
+        # comes back as an error message, not as a None body.
+        code, body = self.auth_get_tuple(
             AUTH_VALIDATE_PATH + "?data = {}".format(int(time.time())), {}, headers
         )
-        if validated is None:
+        if code != 200 or body is None:
+            message = f"token validation failed: {code} - {body}"
             if quiet:
-                self._arlo.debug("token validation failed")
+                self._arlo.debug(message)
             else:
-                self._arlo.error("token validation failed")
+                self._arlo.error(message)
             return False
         return True
 
@@ -1647,9 +1651,6 @@ class ArloBackEnd(object):
         if success != AuthResult.SUCCESS:
             return False
 
-        # save session in case we updated it
-        self._save_session()
-
         # update sessions headers
         headers = self._headers()
         self._session.headers.update(headers)
@@ -1658,6 +1659,10 @@ class ArloBackEnd(object):
         # session. (May not really be needed for existing but will fail faster.)
         if not self._v2_session():
             return False
+
+        # save session now we know the credentials actually work; saving any
+        # earlier persists tokens that every later run would blindly reuse
+        self._save_session()
         return True
 
     def _notify(self, base, body, trans_id=None):
@@ -1865,6 +1870,13 @@ class ArloBackEnd(object):
         self, path, params=None, headers=None, stream=False, raw=False, timeout=None, cookies=None
     ):
         return self._request(
+            path, "GET", params, headers, stream, raw, timeout, self._arlo.cfg.auth_host, authpost=True, cookies=cookies
+        )
+
+    def auth_get_tuple(
+        self, path, params=None, headers=None, stream=False, raw=False, timeout=None, cookies=None
+    ):
+        return self._request_tuple(
             path, "GET", params, headers, stream, raw, timeout, self._arlo.cfg.auth_host, authpost=True, cookies=cookies
         )
 
