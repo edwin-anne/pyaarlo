@@ -389,14 +389,13 @@ class ArloBase(ArloDevice):
 
                 _set_mode_v2_cb(1)
             else:
-                self._arlo.be.put(
-                    base=self,
-                    body={
-                        "action": "set",
-                        "resource": "modes",
-                        "publishResponse": True,
-                        "properties": {"active": mode_id},
-                    })
+                # V3 is handled at the location level and returns early above, so
+                # only an unknown mode version can land here.
+                self._arlo.error(
+                    "{0}: cannot set mode, unsupported modes version {1}".format(
+                        self.name, self._modes_version
+                    )
+                )
 
         else:
             self._arlo.warning(

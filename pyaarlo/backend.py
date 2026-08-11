@@ -48,7 +48,7 @@ from .constant import (
 )
 from .sseclient import SSEClient
 from .tfa import Arlo2FAConsole, Arlo2FAImap, Arlo2FARestAPI
-from .util import days_until, now_strftime, time_to_arlotime, to_b64
+from .util import now_strftime, time_to_arlotime, to_b64
 
 
 class AuthResult(IntEnum):
@@ -1218,7 +1218,7 @@ class ArloBackEnd(object):
 
     def _start_pingone_auth(self, headers):
         self.debug("starting PingOne auth discovery")
-        self._options = self.auth_options(AUTH_START_PATH, headers)
+        self.auth_options(AUTH_START_PATH, headers)
         code, body = self.auth_post(
             AUTH_START_PATH, {"factorType": "", "userId": self._user_id}, headers
         )
@@ -1238,7 +1238,7 @@ class ArloBackEnd(object):
 
     def _start_factor_auth(self, headers, factor_id, factor_type):
         self.debug(f"starting auth with {factor_type}")
-        self._options = self.auth_options(AUTH_START_PATH, headers)
+        self.auth_options(AUTH_START_PATH, headers)
         return self.auth_post(
             AUTH_START_PATH,
             {"factorId": factor_id, "factorType": "", "userId": self._user_id},
@@ -1272,14 +1272,15 @@ class ArloBackEnd(object):
     def _auth(self) -> AuthResult:
         headers = self._auth_headers()
 
-        # Handle 1015 error
+        # Arlo sporadically rejects the first login attempt, so blind-retry a
+        # couple of times before giving up.
         attempt = 0
         code = 0
         body = None
         while attempt < 3:
             attempt += 1
             self.debug("login attempt #{}".format(attempt))
-            self._options = self.auth_options(AUTH_PATH, headers)
+            self.auth_options(AUTH_PATH, headers)
 
             code, body = self.auth_post(
                 AUTH_PATH,
@@ -1319,7 +1320,7 @@ class ArloBackEnd(object):
             # get available 2fa choices,
             self.debug("getting tfa choices")
 
-            self._options = self.auth_options(AUTH_GET_FACTORID, headers)
+            self.auth_options(AUTH_GET_FACTORID, headers)
 
             # look for code source choice
             self.debug(f"looking for {self._arlo.cfg.tfa_type}/{self._arlo.cfg.tfa_nickname}")
@@ -1365,7 +1366,7 @@ class ArloBackEnd(object):
                     "factorType": "BROWSER",
                     "userId": self._user_id
                 }
-                self._options = self.auth_options(AUTH_START_PATH, headers)
+                self.auth_options(AUTH_START_PATH, headers)
                 code, body = self.auth_post(AUTH_START_PATH, payload, headers)
                 if code == 200:
                     quick_start_complete = True
@@ -1425,7 +1426,7 @@ class ArloBackEnd(object):
                 # get code from TFA source
                 code = tfa.get()
                 if code is None:
-                    self._arlo.error(f"login failed: 2fa: code retrieval failed")
+                    self._arlo.error("login failed: 2fa: code retrieval failed")
                     return AuthResult.CAN_RETRY
 
                 # tidy 2fa
@@ -1571,7 +1572,7 @@ class ArloBackEnd(object):
             "factorData": "",
             "factorType": "BROWSER"
         }
-        self._options = self.auth_options(AUTH_START_PAIRING, headers)
+        self.auth_options(AUTH_START_PAIRING, headers)
         code, body = self.auth_post(AUTH_START_PAIRING, payload, headers, cookies=self._cookies)
         self._save_cookies(self._cookies)
 
@@ -1704,7 +1705,7 @@ class ArloBackEnd(object):
                     self._lock.wait(mend - mnow)
                     mnow = time.monotonic()
                 response = self._requests.pop(tid)
-            except KeyError as _e:
+            except KeyError:
                 self.debug("got a key error")
                 response = None
         self.vdebug("finished transaction-->{}".format(tid))
