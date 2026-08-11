@@ -1686,7 +1686,14 @@ class ArloBackEnd(object):
             headers["Authorization"] = self._token64
             tfa = self._get_tfa()
             if tfa == "manual":
+                # tfa_source == "manual" is a static config choice, so retrying
+                # with the same config hits this branch every time - it can
+                # only be resolved by a human completing the reauth config
+                # flow. Left unclassified this defaulted to RETRY, which is
+                # what put the integration into an unbreakable
+                # ConfigEntryNotReady loop instead of surfacing the reauth card.
                 self._arlo.error("login failed: manual 2fa requires config flow reauth")
+                self._last_auth_action = ErrorAction.FATAL
                 return AuthResult.FAILED
 
             # get available 2fa choices,

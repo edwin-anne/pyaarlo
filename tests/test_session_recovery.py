@@ -180,6 +180,30 @@ class TestLoginFailureReason(BackendFixture):
         self.assertFalse(self.be.auth_failed_permanently)
 
 
+class TestManualTfaIsFatal(BackendFixture):
+    """Field regression: this used to default to RETRY, so Home Assistant
+    retried forever with ConfigEntryNotReady instead of raising
+    ConfigEntryAuthFailed and showing the reauth card - tfa_source="manual"
+    can never succeed without a human completing the reauth flow, so every
+    single retry hit the exact same wall.
+    """
+
+    def test_manual_tfa_is_classified_fatal(self):
+        self.be._arlo.cfg._kw["tfa_source"] = "manual"
+        self.be._user_agent = "linux"
+        self.be.auth_options = lambda *a, **k: None
+        self.be.auth_post_full = lambda *a, **k: ArloResponse(
+            200, {"authCompleted": False, "userId": "u", "token": "t", "expiresIn": 1},
+            action=ErrorAction.OK,
+        )
+
+        result = self.be._auth()
+
+        self.assertEqual(result, AuthResult.FAILED)
+        self.assertEqual(self.be._last_auth_action, ErrorAction.FATAL)
+        self.assertTrue(self.be.auth_failed_permanently)
+
+
 class TestV2Session(BackendFixture):
     def _responses(self, *responses):
         self.calls = []
