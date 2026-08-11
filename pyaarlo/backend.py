@@ -30,9 +30,13 @@ from .constant import (
     DEFAULT_AUTH_HOST,
     DEFAULT_RESOURCES,
     DEVICES_PATH,
+    EVENT_LOGIN_RETRY_MAX,
+    EVENT_LOGIN_RETRY_MIN,
     LOGOUT_PATH,
     MQTT_HOST,
     MQTT_PATH,
+    MQTT_RC_BAD_CREDENTIALS,
+    MQTT_RC_NOT_AUTHORISED,
     MQTT_URL_KEY,
     NOTIFY_PATH,
     ORIGIN_HOST,
@@ -46,8 +50,15 @@ from .constant import (
     TRANSID_PREFIX,
     USER_AGENTS,
 )
-from .errors import QUIET, ArloResponse, ErrorAction, classify
-from .sseclient import SSEClient
+from .errors import (
+    QUIET,
+    ArloResponse,
+    ErrorAction,
+    classify,
+    describe,
+    is_permanent,
+)
+from .sseclient import SSEClient, SSEStatusError
 from .tfa import Arlo2FAConsole, Arlo2FAImap, Arlo2FARestAPI
 from .util import now_strftime, time_to_arlotime, to_b64
 
@@ -440,10 +451,11 @@ class ArloBackEnd(object):
 
         # login
         self._session = None
+        self._last_auth_action = None
+        self._validate_action = ErrorAction.OK
         self._load_cookies()
         self._logged_in = self._login()
         if not self._logged_in:
-            self.debug("failed to log in")
             return
 
     @staticmethod
@@ -546,6 +558,38 @@ class ArloBackEnd(object):
         except:
             pass
         self.debug(f"loading {len(self._cookies)} cookies")
+
+    def _discard_saved_session(self, reason):
+        """Throw away a session the server has refused.
+
+        Without this the rejected token stays on disk - `_save_session()` only
+        runs after a successful login - so every subsequent attempt burns
+        another doomed validation round-trip against the same dead token, and
+        the retry loop can never make progress.
+
+        The cookies go too: they are what makes this a "trusted browser", so if
+        the server no longer honours them there is nothing to preserve. The
+        device id is deliberately kept, since it identifies this client to Arlo
+        and a fresh one would have to earn trust from scratch.
+        """
+        self._arlo.debug(f"discarding saved session: {reason}")
+        self._token = None
+        self._token64 = None
+        self._expires_in = 0
+        self._user_id = None
+        self._web_id = None
+        self._sub_id = None
+        self._browser_auth_code = None
+        self._save_session()
+
+        try:
+            self._cookies.clear()
+        except (AttributeError, KeyError):
+            pass
+        try:
+            os.remove(self._arlo.cfg.cookies_file)
+        except OSError:
+            pass
 
     def _transaction_id(self):
         return 'FE!' + str(uuid.uuid4())
@@ -974,7 +1018,7 @@ class ArloBackEnd(object):
             self._lock.notify_all()
 
     def _event_main(self):
-        self.debug("re-logging in")
+        self.debug("event thread starting")
 
         while not self._stop_thread:
 
@@ -984,14 +1028,32 @@ class ArloBackEnd(object):
                     time_stamp = now_strftime("%Y-%m-%d %H:%M:%S.%f")
                     dump.write("{}: {}\n".format(time_stamp, "event_thread start"))
 
-            # login again if not first iteration, this will also create a new session
+            # Log in again if this is not the first iteration; that also creates
+            # a new session. Back off between attempts: this used to retry every
+            # five seconds forever, which meant a wrong password or a locked
+            # account (9017, "try again after 5 minutes") got hammered
+            # indefinitely, keeping the lockout alive.
+            delay = EVENT_LOGIN_RETRY_MIN
             while not self._logged_in and not self._stop_thread:
                 with self._lock:
-                    self._lock.wait(5)
+                    self._lock.wait(delay)
                 if self._stop_thread:
                     break
                 self.debug("re-logging in")
                 self._logged_in = self._login()
+                if self._logged_in:
+                    break
+                if self.auth_failed_permanently:
+                    # Retrying cannot fix credentials. Stop, and leave the
+                    # failure visible so the integration above can ask the user
+                    # rather than us looping in the background forever.
+                    self._arlo.error(
+                        "giving up on re-login, credentials need attention "
+                        f"({self.last_auth_action.name})"
+                    )
+                    return
+                delay = min(delay * 2, EVENT_LOGIN_RETRY_MAX)
+                self.debug(f"next login attempt in {delay}s")
 
             if self._use_mqtt:
                 self._mqtt_main()
@@ -1035,6 +1097,20 @@ class ArloBackEnd(object):
         # Subscribing in on_connect() means that if we lose the connection and
         # reconnect then subscriptions will be renewed.
         self.debug(f"mqtt: connected={str(rc)}")
+
+        # The broker password is the session token, so a credentials rejection
+        # here means the token is dead. Without this the result code was ignored
+        # and paho happily retried the same dead token.
+        if rc in (MQTT_RC_BAD_CREDENTIALS, MQTT_RC_NOT_AUTHORISED):
+            self._arlo.warning(f"mqtt: session rejected by broker (rc={rc})")
+            self._discard_saved_session(f"mqtt broker rejected the token (rc={rc})")
+            self._mqtt_stop_loop()
+            return
+        if rc != 0:
+            self._arlo.warning(f"mqtt: connect failed (rc={rc})")
+            self._mqtt_stop_loop()
+            return
+
         self._mqtt_subscribe()
         with self._lock:
             self._event_connected = True
@@ -1050,8 +1126,24 @@ class ArloBackEnd(object):
 
             # deal with mqtt specific pieces
             if response.get("action", "") == "logout":
-                # Logged out? MQTT will log back in until stopped.
-                self._arlo.warning("logged out? did you log in from elsewhere?")
+                # Our own client id echoing back is just our own session, not an
+                # eviction, so ignore it - the web client makes the same
+                # distinction.
+                client_id = response.get("clientId")
+                if client_id and client_id == self._event_client_id:
+                    self.debug("mqtt: ignoring our own logout echo")
+                    return
+
+                # Someone else signed in and Arlo revoked this session. The
+                # broker password *is* the session token, so letting paho
+                # reconnect just retries with a credential the server has
+                # already thrown away. Break the loop instead and let the event
+                # thread log in again properly.
+                self._arlo.warning(
+                    "logged out by the server, did you log in from elsewhere?"
+                )
+                self._discard_saved_session("server logged this session out")
+                self._mqtt_stop_loop()
                 return
 
             # pass on to general handler
@@ -1059,6 +1151,13 @@ class ArloBackEnd(object):
 
         except json.decoder.JSONDecodeError as e:
             self.debug("reopening: json error " + str(e))
+
+    def _mqtt_stop_loop(self):
+        """Break out of `loop_forever()` so the event thread can re-login."""
+        try:
+            self._event_client.disconnect()
+        except Exception as e:
+            self.debug(f"mqtt: disconnect failed {type(e).__name__}")
 
     def _mqtt_main(self):
 
@@ -1168,6 +1267,20 @@ class ArloBackEnd(object):
                 # pass on to general handler
                 self._event_handle_response(response)
 
+        except SSEStatusError as e:
+            action = classify(e.status_code)
+            if action is ErrorAction.REAUTH:
+                # The stream refused our token, so reusing it on the next
+                # iteration would fail exactly the same way. Drop it now so the
+                # re-login does a full authentication.
+                self._arlo.warning(
+                    f"event loop rejected our session: {describe(e.status_code)}"
+                )
+                self._discard_saved_session("event stream rejected the token")
+            else:
+                self._arlo.warning(
+                    f"event loop closed by server: {describe(e.status_code)}"
+                )
         except requests.exceptions.ConnectionError:
             self._arlo.warning("event loop timeout")
         except requests.exceptions.HTTPError:
@@ -1397,12 +1510,13 @@ class ArloBackEnd(object):
         attempt = 0
         code = 0
         body = None
+        response = None
         while attempt < 3:
             attempt += 1
             self.debug("login attempt #{}".format(attempt))
             self.auth_options(AUTH_PATH, headers)
 
-            code, body = self.auth_post(
+            response = self.auth_post_full(
                 AUTH_PATH,
                 {
                     "email": self._arlo.cfg.username,
@@ -1412,15 +1526,28 @@ class ArloBackEnd(object):
                 },
                 headers,
             )
+            code, body = response.code, response.body
+            self._last_auth_action = response.action
             if code == 200 or code == 401:
+                break
+            # Never burn the remaining attempts on something retrying cannot
+            # fix. It matters most for 9017, where the account is locked for
+            # five minutes and each extra try prolongs it.
+            if response.action in (ErrorAction.FATAL, ErrorAction.REJECTED):
                 break
             time.sleep(3)
 
+        if response is not None and response.action in (
+            ErrorAction.FATAL,
+            ErrorAction.REJECTED,
+        ):
+            self._arlo.error(f"login failed: {response.describe()}")
+            return AuthResult.FAILED
         if body is None:
             self._arlo.error(f"login failed: {code} - possible cloudflare issue")
             return AuthResult.CAN_RETRY
         if code != 200:
-            self._arlo.error(f"login failed: {code} - {body}")
+            self._arlo.error(f"login failed: {response.describe()}")
             return AuthResult.FAILED
 
         # save new login information
@@ -1618,13 +1745,15 @@ class ArloBackEnd(object):
         headers = self._auth_headers()
         headers["Authorization"] = self._token64
 
-        # Validate it! Check the code as well as the body; a failed validation
-        # comes back as an error message, not as a None body.
-        code, body = self.auth_get_tuple(
+        # Ask the server whether the token is still good. Never infer this from
+        # the clock: a token well inside its expiry can already be dead server
+        # side, and only this call knows.
+        response = self.auth_get_full(
             AUTH_VALIDATE_PATH + "?data = {}".format(int(time.time())), {}, headers
         )
-        if code != 200 or body is None:
-            message = f"token validation failed: {code} - {body}"
+        self._validate_action = response.action
+        if not response.ok or response.body is None:
+            message = f"token validation failed: {response.describe()}"
             if quiet:
                 self._arlo.debug(message)
             else:
@@ -1658,6 +1787,17 @@ class ArloBackEnd(object):
 
         self._arlo.debug("validating saved trusted session")
         if not self._validate(quiet=True):
+            # The server refused the token, so it is worthless. Anything other
+            # than a transport blip means keeping it only guarantees the same
+            # failure next time, so drop it and fall through to a full login.
+            if self._validate_action is not ErrorAction.RETRY:
+                self._discard_saved_session(
+                    f"validation rejected it ({self._validate_action.name})"
+                )
+                # 9276/9233 mean two-step auth was never completed for this
+                # session, so the browser has to be paired again.
+                if self._validate_action is ErrorAction.AUTH_PENDING:
+                    self._needs_pairing = True
             return False
 
         self._needs_pairing = False
@@ -1703,11 +1843,30 @@ class ArloBackEnd(object):
         self._arlo.debug("pairing succeeded")
         return True
 
-    def _v2_session(self):
-        v2_session = self.get(SESSION_PATH)
-        if v2_session is None:
-            self._arlo.error("session start failed")
+    def _v2_session(self, allow_reauth=True):
+        response = self._request_full(SESSION_PATH)
+        if not response.ok:
+            # "session start failed" used to be the whole story, so a dead token
+            # and an Arlo outage read identically. Keep the code, and when the
+            # session is the problem earn a new one rather than failing the
+            # login outright - but only once, so this cannot recurse.
+            if allow_reauth and response.action is ErrorAction.REAUTH:
+                self._arlo.debug(
+                    f"session start rejected ({response.describe()}), re-authenticating"
+                )
+                self._discard_saved_session("session start was rejected")
+                if self._auth_or_reuse_saved_session() != AuthResult.SUCCESS:
+                    self._arlo.error(f"session start failed: {response.describe()}")
+                    self._last_auth_action = response.action
+                    return False
+                self._session.headers.update(self._headers())
+                return self._v2_session(allow_reauth=False)
+
+            self._arlo.error(f"session start failed: {response.describe()}")
+            self._last_auth_action = response.action
             return False
+
+        v2_session = response.body
         self._multi_location = v2_session.get('supportsMultiLocation', False)
         self._arlo.debug(f"multilocation is {self._multi_location}")
 
@@ -1742,6 +1901,9 @@ class ArloBackEnd(object):
             self._session.cookies = self._cookies
 
     def _login(self):
+        # Reset the reason: a caller reading it after we return must see this
+        # attempt's outcome, not a stale one from an earlier try.
+        self._last_auth_action = None
 
         # pickup user configured user agent
         self._user_agent = self.user_agent(self._arlo.cfg.user_agent)
@@ -1753,7 +1915,7 @@ class ArloBackEnd(object):
             self._create_session()
             success = self._auth_or_reuse_saved_session()
             if success == AuthResult.FAILED:
-                return False
+                return self._login_failed()
         else:
             for curve in self._arlo.cfg.ecdh_curves:
                 self.debug(f"CloudFlare curve set to: {curve}")
@@ -1763,14 +1925,16 @@ class ArloBackEnd(object):
                 # error or we failed to get the 2FA code.
                 success = self._auth_or_reuse_saved_session()
                 if success == AuthResult.FAILED:
-                    return False
+                    return self._login_failed()
                 if success == AuthResult.SUCCESS:
                     break
                 success = AuthResult.FAILED
                 self.debug("login failed, trying another ecdh_curve")
 
         if success != AuthResult.SUCCESS:
-            return False
+            # Every curve was exhausted without a definitive answer, so this is
+            # worth another go later rather than a permanent failure.
+            return self._login_failed(ErrorAction.RETRY)
 
         # update sessions headers
         headers = self._headers()
@@ -1779,12 +1943,43 @@ class ArloBackEnd(object):
         # Grab a session. Needed for new session and used to check existing
         # session. (May not really be needed for existing but will fail faster.)
         if not self._v2_session():
-            return False
+            return self._login_failed()
 
         # save session now we know the credentials actually work; saving any
         # earlier persists tokens that every later run would blindly reuse
         self._save_session()
+        self._last_auth_action = ErrorAction.OK
         return True
+
+    def _login_failed(self, action=None):
+        """Record why the login failed, then report the failure.
+
+        `_login()` returns a bare bool, which used to throw away the only thing
+        a caller needs in order to decide between trying again later and asking
+        the user for new credentials.
+        """
+        if action is not None:
+            self._last_auth_action = action
+        elif self._last_auth_action in (None, ErrorAction.OK):
+            # Nothing classified the failure, so assume it is worth retrying: a
+            # wrong "permanent" verdict would keep us down until a restart.
+            self._last_auth_action = ErrorAction.RETRY
+        self.debug(f"failed to log in ({self._last_auth_action.name})")
+        return False
+
+    @property
+    def last_auth_action(self):
+        """How the last login attempt failed, as an :class:`ErrorAction`."""
+        return self._last_auth_action or ErrorAction.RETRY
+
+    @property
+    def auth_failed_permanently(self):
+        """True when retrying the login cannot possibly help.
+
+        Credentials are wrong or expired, or the account is locked. Callers
+        should stop retrying and ask the user, instead of hammering the API.
+        """
+        return is_permanent(self.last_auth_action)
 
     def _notify(self, base, body, trans_id=None):
         if trans_id is None:

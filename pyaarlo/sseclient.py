@@ -11,6 +11,20 @@ import requests
 end_of_field = re.compile(r"\r\n\r\n|\r\r|\n\n")
 
 
+class SSEStatusError(requests.HTTPError):
+    """The event stream was refused with an HTTP error status.
+
+    `raise_for_status()` used to be enough, but it left the caller with no way
+    to tell a 401 - our token is dead, so re-authenticate - from a 502 - Arlo is
+    having a moment, so just reconnect. Both produced the same warning and the
+    same blind retry.
+    """
+
+    def __init__(self, status_code, message=None):
+        self.status_code = status_code
+        super().__init__(message or f"event stream refused: {status_code}")
+
+
 class SSEClient(object):
     def __init__(
         self,
@@ -52,6 +66,10 @@ class SSEClient(object):
         # Keep data here as it streams in
         self.buf = u""
 
+        # Status of the most recent connect attempt, so a caller can react to
+        # *why* the stream would not open.
+        self.status_code = None
+
         self._connect()
 
     def stop(self):
@@ -71,7 +89,12 @@ class SSEClient(object):
 
         # TODO: Ensure we're handling redirects.  Might also stick the 'origin'
         # attribute on Events like the Javascript spec requires.
-        self.resp.raise_for_status()
+        self.status_code = self.resp.status_code
+        if self.status_code >= 400:
+            # Raise our own error rather than calling raise_for_status(), so the
+            # status survives to the caller. Done by hand because the session may
+            # come from curl_cffi, whose exceptions are unrelated to requests'.
+            raise SSEStatusError(self.status_code)
 
     def _event_complete(self):
         return re.search(end_of_field, self.buf) is not None

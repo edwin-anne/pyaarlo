@@ -74,6 +74,16 @@ SLOW_REFRESH_INTERVAL = 10 * 60
 EVENT_STREAM_TIMEOUT = (FAST_REFRESH_INTERVAL * 2) + 5
 MODE_UPDATE_INTERVAL = 2
 
+# Backoff for re-logging in from the event thread. Doubles from min to max, so
+# a persistent outage settles into an occasional retry instead of a tight loop.
+EVENT_LOGIN_RETRY_MIN = 5
+EVENT_LOGIN_RETRY_MAX = 300
+
+# MQTT CONNACK result codes we have to act on. The broker password is the Arlo
+# session token, so these mean the token is gone, not that the broker is unwell.
+MQTT_RC_BAD_CREDENTIALS = 4
+MQTT_RC_NOT_AUTHORISED = 5
+
 # Device capabilities
 PING_CAPABILITY = "pingCapability"
 RESOURCE_CAPABILITY = "resourceCapability"
