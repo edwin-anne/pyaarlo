@@ -236,15 +236,19 @@ class ArloLocation(ArloSuper):
         else:
             params = {"mode": mode_id}
 
-        data = self._arlo.be.put(
+        response = self._arlo.be.put_full(
             LOCATION_ACTIVEMODE_PATH_FORMAT.format(self._id) + f"&revision={mode_revision}",
             params=params,
             headers=self._extra_headers())
 
-        if data is None:
-            self._arlo.error("failed to set mode.")
+        if not response.ok:
+            # An expired token, a revision conflict on the `&revision=` above, a
+            # Cloudflare block and a socket timeout used to produce this one
+            # identical line, with nothing to tell them apart.
+            self._arlo.error(f"failed to set mode: {response.describe()}")
             return
 
+        data = response.body
         mode_revision = data.get("revision")
         self.vdebug(f"new-revision={mode_revision}")
 
@@ -258,11 +262,12 @@ class ArloLocation(ArloSuper):
 
     def update_mode(self):
         """Check and update the base's current mode."""
-        data = self._arlo.be.get(LOCATION_ACTIVEMODE_PATH_FORMAT.format(self._id),
-                                 headers=self._extra_headers())
-        if data is None:
-            self._arlo.error("failed to read active mode.")
+        response = self._arlo.be.get_full(LOCATION_ACTIVEMODE_PATH_FORMAT.format(self._id),
+                                          headers=self._extra_headers())
+        if not response.ok:
+            self._arlo.error(f"failed to read active mode: {response.describe()}")
             return
+        data = response.body
         mode_id = self._resolve_active_mode(data.get("properties", {}))
         mode_revision = data.get("revision")
         self._save_and_do_callbacks(MODE_KEY, mode_id)
@@ -270,11 +275,13 @@ class ArloLocation(ArloSuper):
 
     def update_modes(self, _initial=False):
         """Get and update the available modes for the base."""
-        data = self._arlo.be.get(LOCATION_AUTOMATION_PATH_FORMAT.format(self._id),
-                                 headers=self._extra_headers())
-        if data is None:
-            self._arlo.error("failed to read modes.")
+        response = self._arlo.be.get_full(LOCATION_AUTOMATION_PATH_FORMAT.format(self._id),
+                                          headers=self._extra_headers())
+        if not response.ok:
+            self._arlo.error(f"failed to read modes: {response.describe()}")
             return
+
+        data = response.body
 
         # Parse standard modes (standby, armHome, armAway)
         modes = data.get("modes", {}).get("properties", {})

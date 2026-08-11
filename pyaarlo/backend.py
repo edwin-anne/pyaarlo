@@ -453,6 +453,9 @@ class ArloBackEnd(object):
         self._session = None
         self._last_auth_action = None
         self._validate_action = ErrorAction.OK
+        # Set before the first request: the response hook reads it, and while we
+        # are still logging in it must see False so it stays out of the way.
+        self._logged_in = False
         self._load_cookies()
         self._logged_in = self._login()
         if not self._logged_in:
@@ -560,17 +563,19 @@ class ArloBackEnd(object):
         self.debug(f"loading {len(self._cookies)} cookies")
 
     def _discard_saved_session(self, reason):
-        """Throw away a session the server has refused.
+        """Throw away a token the server has refused.
 
         Without this the rejected token stays on disk - `_save_session()` only
         runs after a successful login - so every subsequent attempt burns
         another doomed validation round-trip against the same dead token, and
         the retry loop can never make progress.
 
-        The cookies go too: they are what makes this a "trusted browser", so if
-        the server no longer honours them there is nothing to preserve. The
-        device id is deliberately kept, since it identifies this client to Arlo
-        and a fresh one would have to earn trust from scratch.
+        Deliberately narrow. The cookies, the browser auth code and the device
+        id all survive, because they are what makes this a *trusted* browser: a
+        dead token says nothing about that trust, and throwing it away would
+        turn a silent re-login into a two-factor prompt the user has to answer
+        by hand. Trust is only re-established when the browser factor itself is
+        refused, which `_auth()` already handles by setting `_needs_pairing`.
         """
         self._arlo.debug(f"discarding saved session: {reason}")
         self._token = None
@@ -579,17 +584,7 @@ class ArloBackEnd(object):
         self._user_id = None
         self._web_id = None
         self._sub_id = None
-        self._browser_auth_code = None
         self._save_session()
-
-        try:
-            self._cookies.clear()
-        except (AttributeError, KeyError):
-            pass
-        try:
-            os.remove(self._arlo.cfg.cookies_file)
-        except OSError:
-            pass
 
     def _transaction_id(self):
         return 'FE!' + str(uuid.uuid4())
@@ -660,7 +655,75 @@ class ArloBackEnd(object):
 
         return False, None, None, None, None
 
+    def _force_event_restart(self):
+        """Break the event loop so the event thread logs in again.
+
+        Clearing `_logged_in` on its own is not enough: the event thread is
+        parked inside the SSE iterator or `loop_forever()` and never looks at
+        it. The official web client does the same thing on a 401 - it tears the
+        push handler down and goes back to login.
+        """
+        client = self._event_client
+        if client is None:
+            return
+        try:
+            if self._use_mqtt:
+                self._mqtt_stop_loop()
+            else:
+                client.stop()
+        except Exception as e:
+            self.debug(f"could not stop the event client: {type(e).__name__}")
+
+    def _note_response(self, response, path):
+        """React to a response saying our session is gone.
+
+        Without this an expired token made every call quietly return None -
+        surfacing as "failed to set mode.", "failed to read modes." and so on -
+        while `is_connected` still claimed True, so nothing above ever learned
+        that the session had died.
+        """
+        if response.action is not ErrorAction.REAUTH:
+            return
+
+        # Only act on the first one. Later calls see _logged_in already False,
+        # which keeps a burst of failing requests from each kicking off a login.
+        if not self._logged_in:
+            return
+
+        self._arlo.warning(
+            f"session rejected on {path}: {response.describe()}, re-authenticating"
+        )
+        self._logged_in = False
+        self._discard_saved_session("an API call was rejected")
+        self._force_event_restart()
+        with self._lock:
+            self._lock.notify_all()
+
     def _request_full(
+            self,
+            path,
+            method="GET",
+            params=None,
+            headers=None,
+            stream=False,
+            raw=False,
+            timeout=None,
+            host=None,
+            authpost=False,
+            cookies=None
+    ):
+        """Make a request, and react if it tells us the session is gone."""
+        response = self._do_request(
+            path=path, method=method, params=params, headers=headers, stream=stream,
+            raw=raw, timeout=timeout, host=host, authpost=authpost, cookies=cookies,
+        )
+        # Auth calls are excluded: they are how we recover, so letting them
+        # trigger a recovery would recurse.
+        if not authpost:
+            self._note_response(response, path)
+        return response
+
+    def _do_request(
             self,
             path,
             method="GET",
@@ -1981,7 +2044,13 @@ class ArloBackEnd(object):
         """
         return is_permanent(self.last_auth_action)
 
-    def _notify(self, base, body, trans_id=None):
+    def _notify_full(self, base, body, trans_id=None):
+        """As :meth:`_notify`, but keeping the classified response.
+
+        Base-station failures carry their code in the legacy `data.error` field -
+        2059 and 2222 both mean the base station is not answering - which a
+        body-only caller cannot tell apart from a dead session.
+        """
         if trans_id is None:
             trans_id = self.gen_trans_id()
 
@@ -1990,14 +2059,19 @@ class ArloBackEnd(object):
             body["from"] = self._web_id
         body["transId"] = trans_id
 
-        response = self.post(
-            NOTIFY_PATH + base.device_id, body, headers={"xcloudId": base.xcloud_id}
+        return self._request_full(
+            NOTIFY_PATH + base.device_id,
+            "POST",
+            params=body,
+            headers={"xcloudId": base.xcloud_id},
         )
 
-        if response is None:
-            return None
-        else:
-            return trans_id
+    def _notify(self, base, body, trans_id=None):
+        if trans_id is None:
+            trans_id = self.gen_trans_id()
+
+        response = self._notify_full(base, body, trans_id=trans_id)
+        return trans_id if response.ok else None
 
     def _start_transaction(self, tid=None):
         if tid is None:
@@ -2095,6 +2169,15 @@ class ArloBackEnd(object):
             self.vdebug("notify+ sent")
             self._arlo.bg.run(self._notify, base=base, body=body)
 
+    def notify_full(self, base, body):
+        """Send a notification, waiting for the response and keeping its detail.
+
+        Use this instead of `notify(wait_for="response")` when the caller has to
+        distinguish "the base station is offline" from "our session is dead" -
+        both of which otherwise just come back as None.
+        """
+        return self._notify_full(base, body)
+
     def get(
         self,
         path,
@@ -2122,6 +2205,42 @@ class ArloBackEnd(object):
                 self._request, path, "GET", params=params, headers=headers,
                 stream=stream, raw=raw, timeout=timeout, host=host, cookies=cookies,
             )
+
+    def get_full(
+        self,
+        path,
+        params=None,
+        headers=None,
+        raw=False,
+        timeout=None,
+        host=None,
+        cookies=None,
+    ):
+        """As :meth:`get`, but keeping the code and the classification.
+
+        `get`/`put`/`post` return the body alone, so a caller seeing None cannot
+        say whether the token expired, the request timed out, or Arlo simply had
+        nothing to give. Use this where that difference matters.
+        """
+        return self._request_full(
+            path, "GET", params=params, headers=headers, raw=raw, timeout=timeout,
+            host=host, cookies=cookies,
+        )
+
+    def put_full(
+        self,
+        path,
+        params=None,
+        headers=None,
+        raw=False,
+        timeout=None,
+        cookies=None,
+    ):
+        """As :meth:`put`, but keeping the code and the classification."""
+        return self._request_full(
+            path, "PUT", params=params, headers=headers, raw=raw, timeout=timeout,
+            cookies=cookies,
+        )
 
     def put(
         self,

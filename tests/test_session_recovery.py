@@ -78,7 +78,6 @@ class TestDiscardSavedSession(BackendFixture):
         self.assertIsNone(self.be._token)
         self.assertIsNone(self.be._token64)
         self.assertEqual(self.be._expires_in, 0)
-        self.assertIsNone(self.be._browser_auth_code)
         # ...and on disk too, otherwise the next run reloads the dead token.
         self.assertIsNone(self.saved_session()["token"])
 
@@ -87,21 +86,15 @@ class TestDiscardSavedSession(BackendFixture):
         self.be._discard_saved_session("test")
         self.assertFalse(self.be._has_saved_session())
 
-    def test_cookies_are_removed(self):
+    def test_browser_trust_survives(self):
+        # A dead token says nothing about whether this browser is trusted.
+        # Dropping the cookies and the pairing code would turn a silent
+        # re-login into a two-factor prompt the user has to answer by hand.
+        self.be._discard_saved_session("test")
         self.assertTrue(os.path.exists(self.cookies_file))
-        self.be._discard_saved_session("test")
-        self.assertFalse(os.path.exists(self.cookies_file))
-        self.assertEqual(len(self.be._cookies), 0)
-
-    def test_device_id_is_kept(self):
-        # The device id is how Arlo recognises this client; a new one would have
-        # to earn trust from scratch.
-        self.be._discard_saved_session("test")
+        self.assertEqual(self.be._browser_auth_code, "browser-code")
         self.assertEqual(self.be._user_device_id, "device-1")
-
-    def test_missing_cookie_file_is_not_an_error(self):
-        os.remove(self.cookies_file)
-        self.be._discard_saved_session("test")
+        self.assertEqual(self.saved_session()["browser_auth_code"], "browser-code")
 
 
 class TestReuseSavedSession(BackendFixture):
@@ -125,7 +118,6 @@ class TestReuseSavedSession(BackendFixture):
         self._validate_returns(ErrorAction.AUTH_PENDING)
         self.assertFalse(self.be._reuse_saved_session())
         self.assertIsNone(self.be._token)
-        self.assertFalse(os.path.exists(self.cookies_file))
 
     def test_auth_pending_asks_for_pairing_again(self):
         self._validate_returns(ErrorAction.AUTH_PENDING)
@@ -317,6 +309,136 @@ class TestMqttLogout(BackendFixture):
 
     def test_broken_json_does_not_raise(self):
         self.be._mqtt_on_message(None, None, FakeMqttMessage("not json"))
+
+
+class FakeSseClient:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class TestResponseHook(BackendFixture):
+    """A rejected API call has to be noticed, not silently returned as None."""
+
+    def setUp(self):
+        super().setUp()
+        self.be._logged_in = True
+        self.be._use_mqtt = False
+        self.be._event_client = FakeSseClient()
+        self.rejected = ArloResponse(
+            401, None, arlo_error=9002, action=ErrorAction.REAUTH
+        )
+
+    def test_rejected_call_marks_us_logged_out(self):
+        # `is_connected` used to keep saying True while every call quietly
+        # returned None, so nothing above ever learned the session had died.
+        self.be._note_response(self.rejected, "/hmsweb/users/devices")
+        self.assertFalse(self.be._logged_in)
+
+    def test_rejected_call_discards_the_session(self):
+        self.be._note_response(self.rejected, "/path")
+        self.assertIsNone(self.be._token)
+
+    def test_rejected_call_breaks_the_event_stream(self):
+        # Clearing the flag is not enough: the event thread is parked inside the
+        # stream and never looks at it.
+        self.be._note_response(self.rejected, "/path")
+        self.assertTrue(self.be._event_client.stopped)
+
+    def test_only_the_first_rejection_acts(self):
+        self.be._note_response(self.rejected, "/path")
+        self.be._event_client = FakeSseClient()
+        self.be._note_response(self.rejected, "/path")
+        self.assertFalse(self.be._event_client.stopped)
+
+    def test_other_failures_are_left_alone(self):
+        for action in (
+            ErrorAction.RETRY,
+            ErrorAction.DEVICE_OFFLINE,
+            ErrorAction.OK,
+            ErrorAction.AUTH_PENDING,
+        ):
+            self.be._logged_in = True
+            self.be._event_client = FakeSseClient()
+            self.be._note_response(ArloResponse(500, None, action=action), "/path")
+            self.assertTrue(self.be._logged_in, action.name)
+            self.assertFalse(self.be._event_client.stopped, action.name)
+
+    def test_missing_event_client_is_not_an_error(self):
+        self.be._event_client = None
+        self.be._note_response(self.rejected, "/path")
+        self.assertFalse(self.be._logged_in)
+
+    def test_auth_calls_do_not_trigger_recovery(self):
+        # Auth calls are how we recover, so letting them trigger a recovery
+        # would recurse.
+        self.be._do_request = lambda **kwargs: self.rejected
+        self.be._request_full("/auth", authpost=True)
+        self.assertTrue(self.be._logged_in)
+
+    def test_normal_calls_do_trigger_recovery(self):
+        self.be._do_request = lambda **kwargs: self.rejected
+        self.be._request_full("/hmsweb/users/session/v2")
+        self.assertFalse(self.be._logged_in)
+
+    def test_mqtt_backend_is_disconnected_instead(self):
+        client = FakeMqttClient()
+        self.be._use_mqtt = True
+        self.be._event_client = client
+        self.be._note_response(self.rejected, "/path")
+        self.assertTrue(client.disconnected)
+
+
+class TestPingClassification(BackendFixture):
+    """A dead session must not be reported as an offline base station."""
+
+    def setUp(self):
+        super().setUp()
+        from pyaarlo.base import ArloBase
+
+        self.base = object.__new__(ArloBase)
+        self.base._arlo = self.be._arlo
+        self.base._id = "BASE-1"
+        self.base._name = "Base"
+        self.saved = []
+        self.base._save_and_do_callbacks = lambda key, value: self.saved.append(
+            (key, value)
+        )
+        self.base.debug = lambda msg: None
+
+        self.be._arlo.be = self.be
+        self.be._sub_id = "subscriptions/x"
+
+    def _ping_returns(self, response):
+        self.be.notify_full = lambda base, body: response
+
+    def test_available_when_the_ping_answers(self):
+        self._ping_returns(ArloResponse(200, {}))
+        self.base._ping_and_check_reply()
+        self.assertEqual(self.saved, [("connectionState", "available")])
+
+    def test_offline_base_station_is_marked_unavailable(self):
+        self._ping_returns(
+            ArloResponse(500, None, arlo_error=2059, action=ErrorAction.DEVICE_OFFLINE)
+        )
+        self.base._ping_and_check_reply()
+        self.assertEqual(self.saved, [("connectionState", "unavailable")])
+
+    def test_rejected_session_does_not_touch_availability(self):
+        # Every device in the account used to be sent offline by an expired
+        # token, which hid the real problem.
+        self._ping_returns(
+            ArloResponse(401, None, arlo_error=9002, action=ErrorAction.REAUTH)
+        )
+        self.base._ping_and_check_reply()
+        self.assertEqual(self.saved, [])
+
+    def test_transient_failure_is_still_unavailable(self):
+        self._ping_returns(ArloResponse(503, None, action=ErrorAction.RETRY))
+        self.base._ping_and_check_reply()
+        self.assertEqual(self.saved, [("connectionState", "unavailable")])
 
 
 class TestMqttConnectResult(BackendFixture):

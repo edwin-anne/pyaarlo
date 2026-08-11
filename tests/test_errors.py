@@ -58,8 +58,12 @@ def make_backend(session):
     """Build a backend without running __init__, which would try to log in."""
     be = object.__new__(ArloBackEnd)
     be._arlo = tests.arlo.PyArlo()
+    be._lock = threading.Condition()
     be._req_lock = threading.Lock()
     be._session = session
+    be._logged_in = False
+    be._event_client = None
+    be._use_mqtt = False
     return be
 
 

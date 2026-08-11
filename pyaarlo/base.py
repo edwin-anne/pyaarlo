@@ -43,6 +43,7 @@ from .constant import (
     TIMEZONE_KEY,
 )
 from .device import ArloDevice
+from .errors import ErrorAction
 from .util import time_to_arlotime
 from .media import ArloBaseStationMediaLibrary
 from .ratls import ArloRatls
@@ -364,6 +365,14 @@ class ArloBase(ArloDevice):
                                 attempt, pprint.pformat(body)
                             )
                         )
+                        if not self._arlo.be.is_connected:
+                            # The request hook has already spotted that the
+                            # session is gone and started a re-login. Retrying
+                            # now only burns attempts against a dead token.
+                            self._arlo.error(
+                                "giving up on setting mode, session is being renewed"
+                            )
+                            return
                         self.debug(
                             "Fetching device list (hoping this will fix arming/disarming)"
                         )
@@ -552,10 +561,24 @@ class ArloBase(ArloDevice):
             "properties": {"devices": [self.device_id]},
         }
         self.debug("pinging {}".format(self.name))
-        if self._arlo.be.notify(base=self, body=body, wait_for="response") is None:
-            self._save_and_do_callbacks(CONNECTION_KEY, "unavailable")
-        else:
+        response = self._arlo.be.notify_full(base=self, body=body)
+
+        if response.ok:
             self._save_and_do_callbacks(CONNECTION_KEY, "available")
+            return
+
+        if response.action is ErrorAction.REAUTH:
+            # Our session died, which says nothing about the base station.
+            # Reporting it as unavailable here used to send every device in the
+            # account offline on an expired token, hiding the real problem.
+            self.debug(f"ping inconclusive, session rejected: {response.describe()}")
+            return
+
+        if response.action is ErrorAction.DEVICE_OFFLINE:
+            self.debug(f"base station is not responding: {response.describe()}")
+        else:
+            self.debug(f"ping failed: {response.describe()}")
+        self._save_and_do_callbacks(CONNECTION_KEY, "unavailable")
 
     def ping(self):
         self._arlo.bg.run(self._ping_and_check_reply)
