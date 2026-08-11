@@ -28,7 +28,6 @@ hass-aarlo/HA.
 import asyncio
 import fractions
 import hashlib
-import json
 import random
 import re
 import socket
@@ -50,33 +49,31 @@ from aiortc.contrib.media import MediaRecorder
 import websockets
 
 from .constant import WEBRTC_SIGNALING_PORT
-
-# These are hardcoded literals in Arlo's own web client (main-JY57BLPJ.js),
-# confirmed inconsistent with the real browser's own User-Agent/Accept-Language -
-# replicated verbatim out of caution rather than using our own values.
-_ARLO_WEBRTC_USER_AGENT = "ArloWebRTC/1 CFNetwork/1329 Darwin/21.3.0"
-_ARLO_WEBRTC_ACCEPT_LANGUAGE = "en-IN,en-GB;q=0.9,en;q=0.8"
-
-# The pseudo-HTTP messages tunneled *inside* the WebSocket use the literals
-# above, but the WebSocket upgrade request itself is made by the real
-# browser and carries its own User-Agent/Accept-Language (confirmed via a
-# real my.arlo.com capture) - not the ArloWebRTC one. websockets' own
-# default User-Agent ("Python/x.y websockets/z") is an obvious tell that
-# this isn't a real client, so replicate a browser-like one here too.
-_ARLO_WEBRTC_WS_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)"
-    " Chrome/128.0.0.0 Safari/537.36"
+from .webrtc_common import (
+    ARLO_WEBRTC_ACCEPT_LANGUAGE as _ARLO_WEBRTC_ACCEPT_LANGUAGE,
+    ARLO_WEBRTC_WS_USER_AGENT as _ARLO_WEBRTC_WS_USER_AGENT,
+    FAST_SIGNALING_TIMEOUT as _FAST_SIGNALING_TIMEOUT,
+    SIGNALING_TIMEOUT as _SIGNALING_TIMEOUT,
+    build_ice_server_kwargs as _build_ice_server_kwargs,
+    domain_with_signaling_port as _domain_with_signaling_port,
+    http_over_ws_message as _http_over_ws_message,
+    initiate_offer_body as _initiate_offer_body,
+    instant_message_body as _instant_message_body,
+    parse_http_over_ws_message as _parse_http_over_ws_message,
+    # Re-exported for tests/test_webrtc.py, which imports it from this module;
+    # no longer called directly here now that the body builders wrap it.
+    rewritten_sip_call_info as _rewritten_sip_call_info,
+    session_disconnected_body as _session_disconnected_body,
 )
 
 _ICE_GATHERING_TIMEOUT = 5
 _CONNECT_TIMEOUT = 10
-_SIGNALING_TIMEOUT = 10
-# Bounds only the synchronous prefix's wait for the INVITE's first response
-# (100 Trying) - kept much tighter than _SIGNALING_TIMEOUT so start() can
-# return to Home Assistant well within its own 10s stream_source() budget;
-# everything after that checkpoint runs in the background and can afford to
-# be patient.
-_FAST_SIGNALING_TIMEOUT = 5
+# _SIGNALING_TIMEOUT/_FAST_SIGNALING_TIMEOUT: imported from webrtc_common above.
+# The "fast" one bounds only the synchronous prefix's wait for the first
+# signaling response (INVITE's 100 Trying, or initiateOffer's JSON reply) -
+# kept much tighter so start() can return to Home Assistant well within its
+# own 10s stream_source() budget; everything after that checkpoint runs in
+# the background and can afford to be patient.
 _KEEPALIVE_INTERVAL = 30
 # Matches scryptedapp/arlo's generic WebRTC bridge (wrtc-to-rtsp.ts), which
 # found empirically that a gateway-style backend like this one needs a
@@ -617,70 +614,11 @@ class _TcpSocketWriter:
 
 
 def _build_ice_servers(ice_servers_data):
-    servers = []
-    for entry in ice_servers_data or []:
-        server_type = entry.get("type")
-        domain = entry.get("domain")
-        port = entry.get("port")
-        if not server_type or not domain or not port:
-            continue
-
-        url = "{}:{}:{}".format(server_type, domain, port)
-        transport = entry.get("transport")
-        if server_type in ("turn", "turns") and transport:
-            # aiortc defaults TURN URLs without ?transport= to UDP. Arlo gives
-            # separate TCP/UDP TURN entries, so keep that distinction.
-            url = "{}?transport={}".format(url, transport)
-
-        kwargs = {"urls": url}
-        if entry.get("username"):
-            kwargs["username"] = entry["username"]
-        if entry.get("credential"):
-            kwargs["credential"] = entry["credential"]
-        servers.append(RTCIceServer(**kwargs))
-    return servers
-
-
-def _rewritten_sip_call_info(sip_call_info, domain_with_port):
-    """Arlo's own client rewrites domain/port to the signaling host:port and
-    drops conferenceId/callId/deviceId before sending sipCallInfo back."""
-    return {
-        "calleeUri": sip_call_info["calleeUri"],
-        "id": sip_call_info["id"],
-        "password": sip_call_info["password"],
-        "domain": domain_with_port,
-        "port": str(WEBRTC_SIGNALING_PORT),
-    }
-
-
-def _http_over_ws_message(request_line, host, body_obj):
-    """Build the pseudo-HTTP text frame hmswebsocketproxy expects."""
-    body = json.dumps(body_obj)
-    headers = (
-        "{request_line} HTTP/1.1\r\n"
-        "Host: {host}\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: keep-alive\r\n"
-        "Accept: */*\r\n"
-        "User-Agent: {ua}\r\n"
-        "Content-Length: {length}\r\n"
-        "Accept-Language: {lang}\r\n"
-        "Accept-Encoding: gzip, deflate, br\r\n"
-        "\r\n"
-    ).format(
-        request_line=request_line,
-        host=host,
-        ua=_ARLO_WEBRTC_USER_AGENT,
-        length=len(body),
-        lang=_ARLO_WEBRTC_ACCEPT_LANGUAGE,
-    )
-    return headers + body
-
-
-def _parse_http_over_ws_message(text):
-    """Parse the pseudo-HTTP response hmswebsocketproxy sends back."""
-    header_end = text.index("\r\n\r\n")
-    return json.loads(text[header_end + 4:])
+    """aiortc-typed wrapper around webrtc_common's dependency-free normalization."""
+    return [
+        RTCIceServer(**kwargs)
+        for kwargs in _build_ice_server_kwargs(ice_servers_data)
+    ]
 
 
 # Real SIP signaling (REGISTER-less INVITE/ACK/BYE/MESSAGE), as an
@@ -1491,21 +1429,21 @@ class ArloWebRtcSession:
             raise
 
     async def _send_instant_message(self, message_string):
-        """Arlo's own web player sends a SIP MESSAGE "keepAlive" immediately
-        after the call is established and every 30s thereafter for the life
-        of the call (SIP.js UserAgent.message() in main-JY57BLPJ.js's
-        startKeepAlive()); without it FreeSWITCH negotiates ICE/DTLS fine but
-        never actually relays real media. hmswebsocketproxy's JSON-over-WS
-        equivalent of that SIP MESSAGE is this instantMessage endpoint."""
-        domain = self._sip_call_info["domain"]
-        domain_with_port = "{}:{}".format(domain, WEBRTC_SIGNALING_PORT)
-        body = {
-            "sipCallInfo": _rewritten_sip_call_info(self._sip_call_info, domain_with_port),
-            "payload": {
-                "sessionId": self._session_id,
-                "MessageString": message_string,
-            },
-        }
+        """Send hmswebsocketproxy's JSON-over-WS equivalent of a SIP MESSAGE.
+
+        The 30s keepalive interval this is used for (_KEEPALIVE_INTERVAL) is
+        NOT observed on Arlo's own web player for the camera-video path -
+        main-JY57BLPJ.js's startKeepAlive()/SIP MESSAGE "keepAlive" every 30s
+        belongs to a different feature (the two-way-audio SIP.js call path);
+        the video WebRTCPlayer sends no keepalive of any kind. This is
+        borrowed by analogy from scryptedapp/arlo's Go SIP client, which uses
+        the same 30s interval successfully on this same live-view path over
+        real SIP - not confirmed as necessary (or accepted) on the JSON-over-WS
+        dialect specifically."""
+        domain_with_port = _domain_with_signaling_port(self._sip_call_info)
+        body = _instant_message_body(
+            self._sip_call_info, self._session_id, message_string, domain_with_port
+        )
         message = _http_over_ws_message(
             "POST /hmswebsocketproxy/instantMessage", domain_with_port, body
         )
@@ -1895,8 +1833,7 @@ class ArloWebRtcSession:
             raise WebRtcSessionError("WebRTC video track was not received")
 
     async def _negotiate(self, offer_sdp):
-        domain = self._sip_call_info["domain"]
-        domain_with_port = "{}:{}".format(domain, WEBRTC_SIGNALING_PORT)
+        domain_with_port = _domain_with_signaling_port(self._sip_call_info)
         self._ws = await websockets.connect(
             "wss://{}".format(domain_with_port),
             subprotocols=["sip"],
@@ -1910,14 +1847,10 @@ class ArloWebRtcSession:
                 "Accept-Language": _ARLO_WEBRTC_ACCEPT_LANGUAGE,
             },
         )
-        body = {
-            "sipCallInfo": _rewritten_sip_call_info(self._sip_call_info, domain_with_port),
-            "payload": {
-                "sessionId": self._session_id,
-                "cameraId": self._sip_call_info.get("deviceId", self._camera.device_id),
-                "offer": {"format": "SDP", "value": offer_sdp},
-            },
-        }
+        body = _initiate_offer_body(
+            self._sip_call_info, self._camera.device_id, self._session_id,
+            offer_sdp, domain_with_port,
+        )
         message = _http_over_ws_message(
             "POST /hmswebsocketproxy/initiateOffer", domain_with_port, body
         )
@@ -2147,15 +2080,11 @@ class ArloWebRtcSession:
                 if _USE_REAL_SIP and self._sip_to_header is not None:
                     await self._send_sip_bye()
                 elif not _USE_REAL_SIP:
-                    domain = self._sip_call_info["domain"]
-                    domain_with_port = "{}:{}".format(domain, WEBRTC_SIGNALING_PORT)
-                    body = {
-                        "sipCallInfo": _rewritten_sip_call_info(self._sip_call_info, domain_with_port),
-                        "payload": {
-                            "sessionId": self._session_id,
-                            "cameraId": self._sip_call_info.get("deviceId", self._camera.device_id),
-                        },
-                    }
+                    domain_with_port = _domain_with_signaling_port(self._sip_call_info)
+                    body = _session_disconnected_body(
+                        self._sip_call_info, self._camera.device_id, self._session_id,
+                        domain_with_port,
+                    )
                     message = _http_over_ws_message(
                         "POST /hmswebsocketproxy/sessionDisconnected", domain_with_port, body
                     )
