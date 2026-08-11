@@ -89,6 +89,7 @@ from .constant import (
 )
 from .device import ArloChildDevice
 from .util import http_get, http_get_img, the_epoch
+from .webrtc_common import build_ice_server_kwargs
 
 _model_capabilities_cache = {}
 
@@ -133,6 +134,11 @@ class ArloCamera(ArloChildDevice):
         # active SIP/WebRTC live-view session, if any (see webrtc.py)
         self._webrtc_session = None
         self._webrtc_starting = False
+        # ICE servers from the most recent successful _get_sip_info(), if any.
+        # Exposed synchronously via cached_ice_servers so a caller that can't
+        # block on a network call (e.g. a Home Assistant @callback) can still
+        # get a recent set of Arlo's own TURN/STUN servers.
+        self._cached_ice_servers = []
 
     def _parse_statistic(self, data, scale):
         """Parse binary statistics returned from the history API"""
@@ -383,7 +389,22 @@ class ArloCamera(ArloChildDevice):
             "uniqueId": "{}_{}".format(self._arlo.be.user_id, self.device_id),
         }
         headers = {"xcloudId": self.xcloud_id, "cameraId": self.device_id}
-        return self._arlo.be.get(SIP_INFO_PATH, params=params, headers=headers)
+        sip_info = self._arlo.be.get(SIP_INFO_PATH, params=params, headers=headers)
+        if sip_info is not None:
+            self._cached_ice_servers = build_ice_server_kwargs(
+                (sip_info.get("iceServers") or {}).get("data")
+            )
+        return sip_info
+
+    @property
+    def cached_ice_servers(self):
+        """ICE server kwargs from the most recent successful `_get_sip_info()`.
+
+        `[]` if a live-view attempt has never been made. Plain dicts
+        (`urls`/`username`/`credential`), not a webrtc_models/aiortc type -
+        callers wrap them in whichever ICE-server type they need.
+        """
+        return self._cached_ice_servers
 
     def _get_stream_url(self, starting_for, user_agent=None):
         """Getting the stream URL without starting local streaming."""
