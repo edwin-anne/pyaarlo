@@ -46,6 +46,7 @@ from .constant import (
     TRANSID_PREFIX,
     USER_AGENTS,
 )
+from .errors import QUIET, ArloResponse, ErrorAction, classify
 from .sseclient import SSEClient
 from .tfa import Arlo2FAConsole, Arlo2FAImap, Arlo2FARestAPI
 from .util import now_strftime, time_to_arlotime, to_b64
@@ -554,7 +555,68 @@ class ArloBackEnd(object):
         now = time_to_arlotime()
         return f"{url}{sep}eventId={tid}&time={now}"
 
-    def _request_tuple(
+    @staticmethod
+    def _transport_action(err):
+        """Classify a transport failure.
+
+        The two supported HTTP backends (``requests``/cloudscraper and
+        ``curl_cffi``) have entirely separate exception hierarchies, so match on
+        the name rather than isinstance to stay backend agnostic.
+        """
+        name = type(err).__name__
+        if "Timeout" in name or "ConnectionError" in name or "Timedout" in name:
+            return ErrorAction.RETRY
+        if "SSL" in name or "Certificate" in name:
+            # Usually a proxy or a clock problem: retrying rarely helps, but
+            # calling it fatal would disable the integration until a restart.
+            return ErrorAction.RETRY
+        return ErrorAction.RETRY
+
+    @staticmethod
+    def _parse_envelope(body):
+        """Pull ``meta``/``success`` apart without ever raising.
+
+        ``meta.error`` and ``meta.message`` used to be indexed unguarded, so a
+        non-200 envelope missing either key raised KeyError out of the request
+        path; and the membership test used to match plain strings too, giving a
+        TypeError on any non-JSON body. Both are now impossible.
+
+        :returns: ``(has_envelope, code, arlo_error, message, data)``
+        """
+        if not isinstance(body, dict):
+            return False, None, None, None, None
+
+        meta = body.get("meta")
+        if isinstance(meta, dict):
+            code = meta.get("code")
+            try:
+                code = int(code)
+            except (TypeError, ValueError):
+                code = None
+            arlo_error = meta.get("error")
+            try:
+                arlo_error = int(arlo_error) if arlo_error is not None else None
+            except (TypeError, ValueError):
+                arlo_error = None
+            return True, code, arlo_error, meta.get("message"), body.get("data")
+
+        if "success" in body:
+            if body.get("success"):
+                # Success with no payload: hand back empty data rather than None
+                # so callers can tell it apart from a failure.
+                return True, 200, None, None, body.get("data", {})
+            error = body.get("data", {})
+            arlo_error = error.get("error") if isinstance(error, dict) else None
+            try:
+                arlo_error = int(arlo_error) if arlo_error is not None else None
+            except (TypeError, ValueError):
+                arlo_error = None
+            message = error.get("message") if isinstance(error, dict) else None
+            return True, 500, arlo_error, message, None
+
+        return False, None, None, None, None
+
+    def _request_full(
             self,
             path,
             method="GET",
@@ -567,6 +629,7 @@ class ArloBackEnd(object):
             authpost=False,
             cookies=None
     ):
+        """Make a request and return everything we learned about the outcome."""
         if params is None:
             params = {}
         if headers is None:
@@ -598,7 +661,7 @@ class ArloBackEnd(object):
                         cookies=cookies,
                     )
                     if stream is True:
-                        return 200, r
+                        return ArloResponse(200, r)
                 elif method == "PUT":
                     r = self._session.put(
                         url, json=params, headers=headers, timeout=timeout, cookies=cookies,
@@ -611,13 +674,18 @@ class ArloBackEnd(object):
                     self._session.options(
                         url, json=params, headers=headers, timeout=timeout
                     )
-                    return 200, None
+                    return ArloResponse(200, None)
         except Exception as e:
             self._arlo.warning("request-error={}".format(type(e).__name__))
-            return 500, None
+            return ArloResponse(
+                500,
+                None,
+                message="request failed: {}".format(type(e).__name__),
+                action=self._transport_action(e),
+            )
 
         try:
-            if "application/json" in r.headers["Content-Type"]:
+            if "application/json" in r.headers.get("Content-Type", ""):
                 body = r.json()
             else:
                 body = r.text
@@ -625,36 +693,86 @@ class ArloBackEnd(object):
         except Exception as e:
             self._arlo.warning("body-error={}".format(type(e).__name__))
             self._arlo.debug(f"request-text={r.text}")
-            return 500, None
+            return ArloResponse(
+                500,
+                None,
+                message="unreadable body: {}".format(type(e).__name__),
+                action=ErrorAction.RETRY,
+            )
 
         self.vdebug("request-end={}".format(r.status_code))
-        if r.status_code != 200:
-            return r.status_code, None
+
+        # Parse the envelope *before* looking at the HTTP status. Arlo returns
+        # its real verdict in meta.error, and it does so on 4xx responses too;
+        # discarding the body on a non-200 threw away the only field that says
+        # what actually went wrong.
+        has_envelope, meta_code, arlo_error, message, data = self._parse_envelope(body)
 
         if raw:
-            return 200, body
+            # Raw callers want the payload untouched, so only the status decides.
+            if r.status_code != 200:
+                return ArloResponse(
+                    r.status_code,
+                    None,
+                    arlo_error=arlo_error,
+                    message=message,
+                    action=classify(r.status_code, arlo_error),
+                )
+            return ArloResponse(200, body)
 
-        # New auth style and TFA helper
-        if "meta" in body:
-            if body["meta"]["code"] == 200:
-                return 200, body["data"]
+        if has_envelope:
+            if meta_code == 200:
+                return ArloResponse(200, data)
+
+            code = meta_code if meta_code is not None else r.status_code
+            action = classify(code, arlo_error)
+            # Codes that are an expected step of logging in are not warnings.
+            # Previously only 9204 was quiet, so a normal 2FA handshake logged
+            # alarming warnings while real failures looked the same.
+            if arlo_error in QUIET:
+                self._arlo.debug("expected auth response=" + str(body))
             else:
-                # don't warn on untrusted errors, they just mean we need to log in
-                if body["meta"]["error"] != 9204:
-                    self._arlo.warning("error in new response=" + str(body))
-                return int(body["meta"]["code"]), body["meta"]["message"]
+                self._arlo.warning("error in new response=" + str(body))
+            return ArloResponse(
+                code,
+                message,
+                arlo_error=arlo_error,
+                message=message,
+                action=action,
+            )
 
-        # Original response type
-        elif "success" in body:
-            if body["success"]:
-                if "data" in body:
-                    return 200, body["data"]
-                # success, but no data so fake empty data
-                return 200, {}
-            else:
-                self._arlo.warning("error in response=" + str(body))
+        if r.status_code != 200:
+            return ArloResponse(
+                r.status_code,
+                None,
+                message="http error",
+                action=classify(r.status_code),
+            )
 
-        return 500, None
+        # A 200 we cannot make sense of: neither envelope style matched.
+        self._arlo.warning("unrecognised response=" + str(body)[:256])
+        return ArloResponse(
+            500, None, message="unrecognised response", action=ErrorAction.RETRY
+        )
+
+    def _request_tuple(
+            self,
+            path,
+            method="GET",
+            params=None,
+            headers=None,
+            stream=False,
+            raw=False,
+            timeout=None,
+            host=None,
+            authpost=False,
+            cookies=None
+    ):
+        response = self._request_full(
+            path=path, method=method, params=params, headers=headers, stream=stream,
+            raw=raw, timeout=timeout, host=host, authpost=authpost, cookies=cookies,
+        )
+        return response.code, response.body
 
     def _request(
             self,
@@ -669,9 +787,11 @@ class ArloBackEnd(object):
             authpost=False,
             cookies=None
     ):
-        code, body = self._request_tuple(path=path, method=method, params=params, headers=headers,
-                                         stream=stream, raw=raw, timeout=timeout, host=host, authpost=authpost, cookies=cookies)
-        return body
+        response = self._request_full(
+            path=path, method=method, params=params, headers=headers, stream=stream,
+            raw=raw, timeout=timeout, host=host, authpost=authpost, cookies=cookies,
+        )
+        return response.body if response.ok else None
 
     def gen_trans_id(self, trans_type=TRANSID_PREFIX):
         return trans_type + "!" + str(uuid.uuid4())
@@ -1794,13 +1914,18 @@ class ArloBackEnd(object):
     ):
         if wait_for == "response":
             self.vdebug("get+response running")
+            # Keyword arguments only: passing these positionally silently landed
+            # `cookies` on `authpost`, which dropped the transaction id and left
+            # the cookie jar unused.
             return self._request(
-                path, "GET", params, headers, stream, raw, timeout, host, cookies
+                path, "GET", params=params, headers=headers, stream=stream, raw=raw,
+                timeout=timeout, host=host, cookies=cookies,
             )
         else:
             self.vdebug("get sent")
             self._arlo.bg.run(
-                self._request, path, "GET", params, headers, stream, raw, timeout, host
+                self._request, path, "GET", params=params, headers=headers,
+                stream=stream, raw=raw, timeout=timeout, host=host, cookies=cookies,
             )
 
     def put(
@@ -1815,11 +1940,17 @@ class ArloBackEnd(object):
     ):
         if wait_for == "response":
             self.vdebug("put+response running")
-            return self._request(path, "PUT", params, headers, False, raw, timeout, cookies)
+            # Keyword arguments only: positionally, `cookies` became `host` and
+            # was used as the base URL.
+            return self._request(
+                path, "PUT", params=params, headers=headers, raw=raw, timeout=timeout,
+                cookies=cookies,
+            )
         else:
             self.vdebug("put sent")
             self._arlo.bg.run(
-                self._request, path, "PUT", params, headers, False, raw, timeout
+                self._request, path, "PUT", params=params, headers=headers, raw=raw,
+                timeout=timeout, cookies=cookies,
             )
 
     def post(
@@ -1851,41 +1982,62 @@ class ArloBackEnd(object):
             if tid is None:
                 tid = list(params.keys())[0]
             tid = self._start_transaction(tid)
-            self._request(path, "POST", params, headers, False, raw, timeout)
+            self._request(path, "POST", params=params, headers=headers, raw=raw, timeout=timeout)
             return self._wait_for_transaction(tid, timeout)
         if wait_for == "response":
             self.vdebug("post+response running")
-            return self._request(path, "POST", params, headers, False, raw, timeout)
+            return self._request(path, "POST", params=params, headers=headers, raw=raw, timeout=timeout)
         else:
             self.vdebug("post sent")
             self._arlo.bg.run(
-                self._request, path, "POST", params, headers, False, raw, timeout
+                self._request, path, "POST", params=params, headers=headers, raw=raw,
+                timeout=timeout,
             )
 
     def auth_post(self, path, params=None, headers=None, raw=False, timeout=None, cookies=None):
         return self._request_tuple(
-            path, "POST", params, headers, False, raw, timeout, self._arlo.cfg.auth_host, authpost=True, cookies=cookies
+            path, "POST", params=params, headers=headers, raw=raw, timeout=timeout,
+            host=self._arlo.cfg.auth_host, authpost=True, cookies=cookies,
+        )
+
+    def auth_post_full(self, path, params=None, headers=None, raw=False, timeout=None, cookies=None):
+        """As :meth:`auth_post`, but keeping the classified error detail."""
+        return self._request_full(
+            path, "POST", params=params, headers=headers, raw=raw, timeout=timeout,
+            host=self._arlo.cfg.auth_host, authpost=True, cookies=cookies,
         )
 
     def auth_get(
         self, path, params=None, headers=None, stream=False, raw=False, timeout=None, cookies=None
     ):
         return self._request(
-            path, "GET", params, headers, stream, raw, timeout, self._arlo.cfg.auth_host, authpost=True, cookies=cookies
+            path, "GET", params=params, headers=headers, stream=stream, raw=raw,
+            timeout=timeout, host=self._arlo.cfg.auth_host, authpost=True, cookies=cookies,
         )
 
     def auth_get_tuple(
         self, path, params=None, headers=None, stream=False, raw=False, timeout=None, cookies=None
     ):
         return self._request_tuple(
-            path, "GET", params, headers, stream, raw, timeout, self._arlo.cfg.auth_host, authpost=True, cookies=cookies
+            path, "GET", params=params, headers=headers, stream=stream, raw=raw,
+            timeout=timeout, host=self._arlo.cfg.auth_host, authpost=True, cookies=cookies,
+        )
+
+    def auth_get_full(
+        self, path, params=None, headers=None, stream=False, raw=False, timeout=None, cookies=None
+    ):
+        """As :meth:`auth_get`, but keeping the classified error detail."""
+        return self._request_full(
+            path, "GET", params=params, headers=headers, stream=stream, raw=raw,
+            timeout=timeout, host=self._arlo.cfg.auth_host, authpost=True, cookies=cookies,
         )
 
     def auth_options(
         self, path, headers=None, timeout=None
      ):
         return self._request(
-            path, "OPTIONS", None, headers, False, False, timeout, self._arlo.cfg.auth_host, authpost=True
+            path, "OPTIONS", headers=headers, timeout=timeout,
+            host=self._arlo.cfg.auth_host, authpost=True,
         )
 
     @property
