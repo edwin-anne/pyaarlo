@@ -5,6 +5,7 @@ import tests.arlo
 from pyaarlo.backend import ArloBackEnd
 from pyaarlo.errors import (
     ArloApiError,
+    ArloResponse,
     ErrorAction,
     classify,
     describe,
@@ -144,6 +145,88 @@ class TestArloApiError(TestCase):
 
     def test_transient_is_not_permanent(self):
         self.assertFalse(ArloApiError(500).is_permanent)
+
+
+class TestArloAuthError(TestCase):
+    """The config flow branches on this, so it has to carry the reason."""
+
+    def test_wrong_password_is_a_credentials_problem(self):
+        from pyaarlo.backend import ArloAuthError
+
+        err = ArloAuthError(
+            "login failed",
+            response=ArloResponse(400, None, arlo_error=9015, action=ErrorAction.FATAL),
+        )
+        self.assertEqual(err.action, ErrorAction.FATAL)
+        self.assertEqual(err.arlo_error, 9015)
+        self.assertTrue(err.is_credentials_problem)
+
+    def test_bad_otp_is_a_credentials_problem(self):
+        from pyaarlo.backend import ArloAuthError
+
+        err = ArloAuthError(
+            "bad code",
+            response=ArloResponse(400, None, arlo_error=9236, action=ErrorAction.OTP_RETRY),
+        )
+        self.assertTrue(err.is_credentials_problem)
+
+    def test_network_failure_is_not(self):
+        # Reporting this as bad credentials would send someone looking at their
+        # password when the problem is their network.
+        from pyaarlo.backend import ArloAuthError
+
+        err = ArloAuthError("request failed: ConnectionError", action=ErrorAction.RETRY)
+        self.assertFalse(err.is_credentials_problem)
+
+    def test_defaults_to_retryable(self):
+        from pyaarlo.backend import ArloAuthError
+
+        self.assertEqual(ArloAuthError("boom").action, ErrorAction.RETRY)
+
+
+class TestParseAuthHelperResponse(TestCase):
+    """The config-flow helpers share the main envelope parser."""
+
+    def _parse(self, response):
+        from pyaarlo.backend import _parse_auth_helper_response
+
+        return _parse_auth_helper_response(response)
+
+    def test_success(self):
+        result = self._parse(FakeResponse(200, {"meta": {"code": 200}, "data": {"a": 1}}))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.body, {"a": 1})
+
+    def test_wrong_password_is_classified(self):
+        result = self._parse(
+            FakeResponse(
+                200,
+                {"meta": {"code": 400, "error": 9015, "message": "Password not correct"}},
+            )
+        )
+        self.assertEqual(result.arlo_error, 9015)
+        self.assertEqual(result.action, ErrorAction.FATAL)
+
+    def test_arlo_code_survives_a_non_200(self):
+        # The helper used to discard the body on any non-200, so meta.error was
+        # unreachable exactly when it mattered most.
+        result = self._parse(
+            FakeResponse(401, {"meta": {"code": 401, "error": 9017, "message": "locked"}})
+        )
+        self.assertEqual(result.arlo_error, 9017)
+        self.assertEqual(result.action, ErrorAction.FATAL)
+
+    def test_malformed_envelope_does_not_raise(self):
+        result = self._parse(FakeResponse(200, {"meta": {"code": 400}}))
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.arlo_error)
+
+    def test_html_error_page(self):
+        result = self._parse(
+            FakeResponse(503, None, text="<html>meta</html>", content_type="text/html")
+        )
+        self.assertEqual(result.code, 503)
+        self.assertEqual(result.action, ErrorAction.RETRY)
 
 
 class TestParseEnvelope(TestCase):

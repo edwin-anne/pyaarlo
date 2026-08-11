@@ -70,7 +70,29 @@ class AuthResult(IntEnum):
 
 
 class ArloAuthError(Exception):
-    """Raised when an Arlo authentication helper call fails."""
+    """Raised when an Arlo authentication helper call fails.
+
+    Carries the classification as well as the text, so a caller - the config
+    flow, mainly - can tell "that password is wrong" from "Arlo is unreachable"
+    and say something useful. It used to be a bare string, leaving the caller to
+    guess, which meant every failure was reported as a connection problem.
+    """
+
+    def __init__(self, message, response=None, action=None):
+        super().__init__(message)
+        self.response = response
+        if action is not None:
+            self.action = action
+        elif response is not None:
+            self.action = response.action
+        else:
+            self.action = ErrorAction.RETRY
+        self.arlo_error = response.arlo_error if response is not None else None
+
+    @property
+    def is_credentials_problem(self):
+        """True when the user has to fix something before this can work."""
+        return is_permanent(self.action) or self.action is ErrorAction.OTP_RETRY
 
 
 class ArloManualAuthSession:
@@ -150,33 +172,58 @@ def _curl_cffi_impersonations(configured):
 
 
 def _parse_auth_helper_response(response):
+    """Turn a helper response into an :class:`ArloResponse`.
+
+    Shares `ArloBackEnd._parse_envelope` with the main request path rather than
+    reimplementing it, so both stay honest about malformed envelopes and both see
+    `meta.error` on a non-200.
+    """
     try:
         body = response.json()
     except Exception:
         body = response.text
 
+    has_envelope, meta_code, arlo_error, message, data = ArloBackEnd._parse_envelope(body)
+
+    if has_envelope and meta_code == 200:
+        return ArloResponse(200, data)
+
+    if has_envelope:
+        code = meta_code if meta_code is not None else response.status_code
+        return ArloResponse(
+            code,
+            message,
+            arlo_error=arlo_error,
+            message=message,
+            action=classify(code, arlo_error),
+        )
+
     if response.status_code != 200:
-        return response.status_code, None
+        return ArloResponse(
+            response.status_code,
+            None,
+            message="http error",
+            action=classify(response.status_code),
+        )
 
-    if isinstance(body, dict) and "meta" in body:
-        if body["meta"]["code"] == 200:
-            return 200, body["data"]
-        return int(body["meta"]["code"]), body["meta"].get("message")
-
-    return 500, None
+    return ArloResponse(
+        500, None, message="unrecognised response", action=ErrorAction.RETRY
+    )
 
 
 def _auth_helper_request(session, method, url, params=None, headers=None, timeout=60):
     try:
         if method == "OPTIONS":
             session.options(url, json=params, headers=headers, timeout=timeout)
-            return 200, None
+            return ArloResponse(200, None)
         if method == "GET":
             response = session.get(url, headers=headers, timeout=timeout)
         else:
             response = session.post(url, json=params, headers=headers, timeout=timeout)
     except Exception as err:
-        raise ArloAuthError(f"request failed: {type(err).__name__}") from err
+        raise ArloAuthError(
+            f"request failed: {type(err).__name__}", action=ErrorAction.RETRY
+        ) from err
 
     return _parse_auth_helper_response(response)
 
@@ -199,7 +246,7 @@ def get_available_2fa_factors(
     _auth_helper_request(
         session, "OPTIONS", auth_host + AUTH_PATH, headers=headers, timeout=request_timeout
     )
-    code, body = _auth_helper_request(
+    response = _auth_helper_request(
         session,
         "POST",
         auth_host + AUTH_PATH,
@@ -213,10 +260,13 @@ def get_available_2fa_factors(
         request_timeout,
     )
 
-    if code == 429:
-        raise ArloAuthError("429 - possible cloudflare issue")
-    if code != 200 or body is None:
-        raise ArloAuthError(f"{code} - {body}")
+    if response.code == 429:
+        raise ArloAuthError(
+            "429 - possible cloudflare issue", action=ErrorAction.RETRY
+        )
+    if not response.ok or response.body is None:
+        raise ArloAuthError(f"login failed: {response.describe()}", response=response)
+    body = response.body
     if body.get("authCompleted", False):
         return []
 
@@ -227,11 +277,14 @@ def get_available_2fa_factors(
     _auth_helper_request(
         session, "OPTIONS", auth_host + AUTH_GET_FACTORS, headers=headers, timeout=request_timeout
     )
-    code, factors = _auth_helper_request(
+    response = _auth_helper_request(
         session, "GET", factors_url, headers=headers, timeout=request_timeout
     )
-    if code != 200 or factors is None:
-        raise ArloAuthError(f"2fa factors failed: {code} - {factors}")
+    if not response.ok or response.body is None:
+        raise ArloAuthError(
+            f"2fa factors failed: {response.describe()}", response=response
+        )
+    factors = response.body
 
     return [
         {
@@ -265,7 +318,7 @@ def start_interactive_2fa_auth(
     _auth_helper_request(
         session, "OPTIONS", auth_host + AUTH_PATH, headers=headers, timeout=request_timeout
     )
-    code, body = _auth_helper_request(
+    response = _auth_helper_request(
         session,
         "POST",
         auth_host + AUTH_PATH,
@@ -278,8 +331,9 @@ def start_interactive_2fa_auth(
         headers,
         request_timeout,
     )
-    if code != 200 or body is None:
-        raise ArloAuthError(f"{code} - {body}")
+    if not response.ok or response.body is None:
+        raise ArloAuthError(f"login failed: {response.describe()}", response=response)
+    body = response.body
     if body.get("authCompleted", False):
         token_body = body.get("accessToken", body)
         return ArloManualAuthSession(
@@ -301,16 +355,15 @@ def start_interactive_2fa_auth(
         {"factorId": factor_id, "factorType": str(factor_type or "").upper(), "userId": token_body["userId"]},
         {"factorId": factor_id, "userId": token_body["userId"]},
     ]
-    last_code = 500
-    last_body = None
+    last = ArloResponse(500, None, action=ErrorAction.RETRY)
     for payload in attempts:
         _auth_helper_request(
             session, "OPTIONS", auth_host + AUTH_START_PATH, headers=headers, timeout=request_timeout
         )
-        last_code, last_body = _auth_helper_request(
+        last = _auth_helper_request(
             session, "POST", auth_host + AUTH_START_PATH, payload, headers, request_timeout
         )
-        if last_code == 200 and isinstance(last_body, dict):
+        if last.ok and isinstance(last.body, dict):
             return ArloManualAuthSession(
                 session,
                 headers,
@@ -319,10 +372,14 @@ def start_interactive_2fa_auth(
                 token_body["token"],
                 token_body["expiresIn"],
                 user_device_id,
-                last_body["factorAuthCode"],
+                last.body["factorAuthCode"],
             )
+        if is_permanent(last.action):
+            # No point trying the other payload shapes: the account itself is
+            # the problem, not the way we asked.
+            break
 
-    raise ArloAuthError(f"start failed: {last_code} - {last_body}")
+    raise ArloAuthError(f"start failed: {last.describe()}", response=last)
 
 
 def finish_interactive_2fa_auth(
@@ -341,7 +398,7 @@ def finish_interactive_2fa_auth(
         headers=headers,
         timeout=request_timeout,
     )
-    code, body = _auth_helper_request(
+    response = _auth_helper_request(
         auth_session.session,
         "POST",
         auth_host + AUTH_FINISH_PATH,
@@ -353,9 +410,12 @@ def finish_interactive_2fa_auth(
         headers,
         request_timeout,
     )
-    if code != 200 or not isinstance(body, dict):
-        raise ArloAuthError(f"finish failed: {code} - {body}")
+    if not response.ok or not isinstance(response.body, dict):
+        raise ArloAuthError(
+            f"finish failed: {response.describe()}", response=response
+        )
 
+    body = response.body
     token_body = body.get("accessToken", body)
     browser_auth_code = body.get("browserAuthCode")
     headers["Authorization"] = to_b64(token_body["token"])
@@ -368,7 +428,7 @@ def finish_interactive_2fa_auth(
             headers=headers,
             timeout=request_timeout,
         )
-        code, body = _auth_helper_request(
+        pairing = _auth_helper_request(
             auth_session.session,
             "POST",
             auth_host + AUTH_START_PAIRING,
@@ -380,8 +440,10 @@ def finish_interactive_2fa_auth(
             headers,
             request_timeout,
         )
-        if code != 200:
-            raise ArloAuthError(f"pairing failed: {code} - {body}")
+        if not pairing.ok:
+            raise ArloAuthError(
+                f"pairing failed: {pairing.describe()}", response=pairing
+            )
 
     os.makedirs(storage_dir, exist_ok=True)
     session_file = os.path.join(storage_dir, "session.pickle")
