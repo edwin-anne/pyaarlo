@@ -7,7 +7,8 @@ full ArloCamera instance so the tests don't need real device/backend wiring.
 """
 import json
 import threading
-from types import SimpleNamespace
+import time
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -246,6 +247,12 @@ def _fake_camera_for_fallback(eligible, disable_cfg, webrtc_raises=None, webrtc_
     cam.supports_sip_webrtc_streaming = MagicMock(return_value=eligible)
     cam.debug = MagicMock()
     cam._start_stream = MagicMock(return_value="rtsps://fallback.example/stream")
+    # Real lease methods (not stubs): _start_stream_with_webrtc_fallback now
+    # calls these for real, and the lock is a no-op MagicMock, so binding the
+    # actual ArloCamera implementation exercises the real acquire/release
+    # logic without needing real threading.
+    cam.begin_webrtc_attempt = MethodType(ArloCamera.begin_webrtc_attempt, cam)
+    cam.end_webrtc_attempt = MethodType(ArloCamera.end_webrtc_attempt, cam)
 
     class FakeSession:
         def __init__(self, camera):
@@ -335,6 +342,112 @@ def test_stop_stream_uses_legacy_idle_for_legacy_stream_when_last_user_stops():
 
     assert cam._local_users == set()
     cam._stop_activity.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Shared WebRTC attempt lease (begin_webrtc_attempt/end_webrtc_attempt),
+# used by both the legacy aiortc path and hass-aarlo's native browser-relay
+# path to keep two live-view negotiations from racing Arlo's API at once.
+# ---------------------------------------------------------------------------
+
+def _fake_camera_for_lease():
+    cam = ArloCamera.__new__(ArloCamera)
+    cam._lock = threading.Condition()
+    cam._webrtc_starting = False
+    cam._webrtc_session = None
+    cam._stream_url = None
+    return cam
+
+
+def test_begin_webrtc_attempt_succeeds_when_free():
+    cam = _fake_camera_for_lease()
+    assert cam.begin_webrtc_attempt(timeout=5) is True
+    assert cam._webrtc_starting is True
+
+
+def test_end_webrtc_attempt_frees_the_lease():
+    cam = _fake_camera_for_lease()
+    cam.begin_webrtc_attempt(timeout=5)
+    cam.end_webrtc_attempt()
+    assert cam._webrtc_starting is False
+
+
+def test_second_attempt_waits_then_succeeds_once_released():
+    cam = _fake_camera_for_lease()
+    assert cam.begin_webrtc_attempt(timeout=5) is True
+
+    results = []
+
+    def contender():
+        results.append(cam.begin_webrtc_attempt(timeout=5))
+
+    t = threading.Thread(target=contender)
+    t.start()
+    time.sleep(0.05)  # give the contender a chance to start waiting
+    assert results == []  # still blocked - the lease is held
+    cam.end_webrtc_attempt()
+    t.join(timeout=5)
+
+    assert results == [True]
+    assert cam._webrtc_starting is True  # the contender now holds it
+
+
+def test_second_attempt_times_out_if_never_released():
+    cam = _fake_camera_for_lease()
+    cam.begin_webrtc_attempt(timeout=5)
+
+    start = time.monotonic()
+    acquired = cam.begin_webrtc_attempt(timeout=0.2)
+    elapsed = time.monotonic() - start
+
+    assert acquired is False
+    assert elapsed < 1  # bounded by the timeout, not left hanging
+    # A timed-out attempt must not disturb the lease it failed to acquire.
+    assert cam._webrtc_starting is True
+
+
+def test_only_one_of_many_concurrent_attempts_holds_the_lease_at_once():
+    cam = _fake_camera_for_lease()
+    concurrent_holders = []
+    lock = threading.Lock()
+
+    def attempt():
+        if cam.begin_webrtc_attempt(timeout=5):
+            with lock:
+                concurrent_holders.append(1)
+                count = len(concurrent_holders)
+            assert count == 1, "two threads held the lease at once"
+            time.sleep(0.01)
+            with lock:
+                concurrent_holders.pop()
+            cam.end_webrtc_attempt()
+
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert cam._webrtc_starting is False
+
+
+def test_stop_alive_legacy_webrtc_session_tears_down_and_clears_refs():
+    session = MagicMock()
+    session.is_alive = True
+    cam = _fake_camera_for_lease()
+    cam._webrtc_session = session
+    cam._stream_url = "tcp://127.0.0.1:1234"
+
+    cam.stop_alive_legacy_webrtc_session()
+
+    session.stop.assert_called_once_with()
+    assert cam._webrtc_session is None
+    assert cam._stream_url is None
+
+
+def test_stop_alive_legacy_webrtc_session_noop_when_none():
+    cam = _fake_camera_for_lease()
+    cam.stop_alive_legacy_webrtc_session()  # no raise, nothing to stop
 
 
 def test_webrtc_mpegts_recorder_muxes_video_only(monkeypatch):

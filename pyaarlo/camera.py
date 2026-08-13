@@ -89,6 +89,7 @@ from .constant import (
 )
 from .device import ArloChildDevice
 from .util import http_get, http_get_img, the_epoch
+from .webrtc_common import build_ice_server_kwargs
 
 _model_capabilities_cache = {}
 
@@ -133,6 +134,11 @@ class ArloCamera(ArloChildDevice):
         # active SIP/WebRTC live-view session, if any (see webrtc.py)
         self._webrtc_session = None
         self._webrtc_starting = False
+        # ICE servers from the most recent successful _get_sip_info(), if any.
+        # Exposed synchronously via cached_ice_servers so a caller that can't
+        # block on a network call (e.g. a Home Assistant @callback) can still
+        # get a recent set of Arlo's own TURN/STUN servers.
+        self._cached_ice_servers = []
 
     def _parse_statistic(self, data, scale):
         """Parse binary statistics returned from the history API"""
@@ -383,7 +389,22 @@ class ArloCamera(ArloChildDevice):
             "uniqueId": "{}_{}".format(self._arlo.be.user_id, self.device_id),
         }
         headers = {"xcloudId": self.xcloud_id, "cameraId": self.device_id}
-        return self._arlo.be.get(SIP_INFO_PATH, params=params, headers=headers)
+        sip_info = self._arlo.be.get(SIP_INFO_PATH, params=params, headers=headers)
+        if sip_info is not None:
+            self._cached_ice_servers = build_ice_server_kwargs(
+                (sip_info.get("iceServers") or {}).get("data")
+            )
+        return sip_info
+
+    @property
+    def cached_ice_servers(self):
+        """ICE server kwargs from the most recent successful `_get_sip_info()`.
+
+        `[]` if a live-view attempt has never been made. Plain dicts
+        (`urls`/`username`/`credential`), not a webrtc_models/aiortc type -
+        callers wrap them in whichever ICE-server type they need.
+        """
+        return self._cached_ice_servers
 
     def _get_stream_url(self, starting_for, user_agent=None):
         """Getting the stream URL without starting local streaming."""
@@ -1072,8 +1093,9 @@ class ArloCamera(ArloChildDevice):
         fall back to RTSP/DASH)."""
         if not self._arlo.cfg.disable_sip_webrtc_streaming and self.supports_sip_webrtc_streaming():
             session = None
+            lease_held = False
             try:
-                from .webrtc import ArloWebRtcSession
+                from .webrtc import ArloWebRtcSession, WebRtcSessionError
                 dead_session = None
                 with self._lock:
                     if (
@@ -1103,19 +1125,30 @@ class ArloCamera(ArloChildDevice):
                 if dead_session is not None:
                     dead_session.stop()
 
+                if not self.begin_webrtc_attempt(timeout=15):
+                    # The lease never freed up within the timeout - rather
+                    # than wait on it forever, fail this attempt and let the
+                    # except block below fall back to RTSP-cloud. lease_held
+                    # stays False: this attempt never acquired it, so the
+                    # except block must not release a lease some other
+                    # in-flight attempt still legitimately holds.
+                    raise WebRtcSessionError(
+                        "timed out waiting for another SIP/WebRTC attempt to finish"
+                    )
+                lease_held = True
                 with self._lock:
-                    while self._webrtc_starting:
-                        self._lock.wait(timeout=15)
-                        if (
-                            self._webrtc_session is not None
-                            and self._stream_url is not None
-                            and self._webrtc_session.is_alive
-                        ):
-                            self._local_users.add("streaming")
-                            self._dump_activities("_start_stream_webrtc_waited")
-                            return self._stream_url
-
-                    self._webrtc_starting = True
+                    if (
+                        self._webrtc_session is not None
+                        and self._stream_url is not None
+                        and self._webrtc_session.is_alive
+                    ):
+                        # Whoever held the lease before us already set up a
+                        # session that is still good - reuse it instead of
+                        # negotiating a second one.
+                        self._local_users.add("streaming")
+                        self._dump_activities("_start_stream_webrtc_waited")
+                        self.end_webrtc_attempt()
+                        return self._stream_url
 
                 session = ArloWebRtcSession(self)
                 # Deliberately no _start_user_stream_activity() here. Arlo's
@@ -1135,8 +1168,7 @@ class ArloCamera(ArloChildDevice):
                     self._webrtc_session = session
                     self._stream_url = url
                     self._local_users.add("streaming")
-                    self._webrtc_starting = False
-                    self._lock.notify_all()
+                self.end_webrtc_attempt()
                 return url
             except Exception as e:
                 self.debug("SIP/WebRTC stream failed ({}), falling back to RTSP-cloud".format(e))
@@ -1144,8 +1176,8 @@ class ArloCamera(ArloChildDevice):
                     session.stop()
                 with self._lock:
                     self._webrtc_session = None
-                    self._webrtc_starting = False
-                    self._lock.notify_all()
+                if lease_held:
+                    self.end_webrtc_attempt()
         return self._start_stream("streaming", user_agent)
 
     def start_snapshot_stream(self, user_agent=None):
@@ -1683,6 +1715,59 @@ class ArloCamera(ArloChildDevice):
         tear down on idle should check this first."""
         session = self._webrtc_session
         return session is not None and session.is_alive
+
+    def begin_webrtc_attempt(self, timeout=15):
+        """Acquire the single per-camera SIP/WebRTC negotiation lease.
+
+        Shared by every way of starting a live-view session for this camera -
+        the legacy aiortc path (_start_stream_with_webrtc_fallback) and a
+        native browser-relay path (see hass-aarlo's ArloWebRtcCam) both call
+        this before negotiating. Arlo's sipInfo/session credentials are
+        single-use per attempt, and the working assumption is that a camera's
+        base station cannot usefully serve two concurrent live-view
+        negotiations - so rather than let two attempts race Arlo's API at
+        once, the second one waits for the first to finish.
+
+        :returns: False if `timeout` seconds pass without the lease freeing
+            up - the caller should treat that as this attempt failing (fall
+            back, or raise), not retry forever. A lease that never frees
+            (e.g. a crashed negotiation that never called `end_webrtc_attempt`)
+            would otherwise wedge every future live-view attempt on this
+            camera permanently.
+        """
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            while self._webrtc_starting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._lock.wait(timeout=remaining)
+            self._webrtc_starting = True
+            return True
+
+    def end_webrtc_attempt(self):
+        """Release the lease acquired by `begin_webrtc_attempt`."""
+        with self._lock:
+            self._webrtc_starting = False
+            self._lock.notify_all()
+
+    def stop_alive_legacy_webrtc_session(self):
+        """Tear down a live legacy (aiortc) session, if any.
+
+        For a native browser-relay caller (see hass-aarlo's ArloWebRtcCam) to
+        use before negotiating its own session: newest live-view attempt
+        wins, on the same "probably only one concurrent session per camera"
+        assumption as the lease above. Only this direction is possible - a
+        native session's state lives entirely in the HA integration layer,
+        which pyaarlo has no reference to, so the legacy path cannot return
+        the favour and tear down an active native session.
+        """
+        with self._lock:
+            session = self._webrtc_session
+            self._webrtc_session = None
+            self._stream_url = None
+        if session is not None:
+            session.stop()
 
     def supports_sip_webrtc_streaming(self):
         """Whether this camera can use the newer SIP/WebRTC live-view path.
