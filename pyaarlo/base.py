@@ -35,6 +35,7 @@ from .constant import (
     MODEL_WIRED_VIDEO_DOORBELL_GEN2_2K,
     MODEL_WIRED_VIDEO_DOORBELL_GEN2_HD,
     PING_CAPABILITY,
+    PING_REAUTH_UNAVAILABLE_GRACE,
     RESOURCE_CAPABILITY,
     RESTART_PATH,
     SCHEDULE_KEY,
@@ -59,6 +60,7 @@ class ArloBase(ArloDevice):
         self._schedules = None
         self._last_update = 0
         self._ratls = None
+        self._reauth_since = None
 
     def _id_to_name(self, mode_id):
         return self._load([MODE_ID_TO_NAME_KEY, mode_id], None)
@@ -564,17 +566,30 @@ class ArloBase(ArloDevice):
         response = self._arlo.be.notify_full(base=self, body=body)
 
         if response.ok:
+            self._reauth_since = None
             self._save_and_do_callbacks(CONNECTION_KEY, "available")
             return
 
         if response.action is ErrorAction.REAUTH:
-            # Our session died, which says nothing about the base station.
-            # Reporting it as unavailable here used to send every device in the
-            # account offline on an expired token, hiding the real problem.
-            self.debug(f"ping inconclusive, session rejected: {response.describe()}")
-            return
-
-        if response.action is ErrorAction.DEVICE_OFFLINE:
+            # Our session died, which says nothing about the base station on
+            # its own. Reporting it as unavailable here used to send every
+            # device in the account offline on an expired token, hiding the
+            # real problem. But leaving availability untouched forever is its
+            # own bug if the session never comes back (a stuck reauth, an
+            # extended 9017 lockout): fall back to the old fail-safe once
+            # reauth has been ongoing longer than the login backoff itself
+            # would ever take to recover.
+            if self._reauth_since is None:
+                self._reauth_since = time.monotonic()
+            stuck_for = time.monotonic() - self._reauth_since
+            if stuck_for < PING_REAUTH_UNAVAILABLE_GRACE:
+                self.debug(f"ping inconclusive, session rejected: {response.describe()}")
+                return
+            self.debug(
+                f"ping inconclusive for {stuck_for:.0f}s, session still rejected:"
+                f" {response.describe()}"
+            )
+        elif response.action is ErrorAction.DEVICE_OFFLINE:
             self.debug(f"base station is not responding: {response.describe()}")
         else:
             self.debug(f"ping failed: {response.describe()}")

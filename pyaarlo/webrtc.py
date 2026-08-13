@@ -1265,7 +1265,7 @@ class ArloWebRtcSession:
         Returns the local stream URL to hand back from get_stream(). Raises
         WebRtcSessionError on any failure.
         """
-        sip_info = self._camera._get_sip_info()
+        sip_info = self._camera.get_sip_info()
         if not sip_info or not sip_info.get("sipCallInfo"):
             raise WebRtcSessionError("no sipInfo available")
         self._sip_call_info = sip_info["sipCallInfo"]

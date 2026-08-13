@@ -51,6 +51,7 @@ from .constant import (
     USER_AGENTS,
 )
 from .errors import (
+    ACCOUNT_LOCKED,
     QUIET,
     ArloResponse,
     ErrorAction,
@@ -149,13 +150,8 @@ def _auth_helper_headers(user_device_id, user_agent, send_source=False):
 
 def _create_auth_helper_session(http_backend, curl_cffi_impersonate):
     if http_backend == "curl_cffi":
-        from curl_cffi import requests as cffi_requests
-        for impersonate in _curl_cffi_impersonations(curl_cffi_impersonate):
-            try:
-                return cffi_requests.Session(impersonate=impersonate)
-            except Exception:
-                continue
-        return cffi_requests.Session(impersonate=curl_cffi_impersonate)
+        session, _ = _create_curl_cffi_session(curl_cffi_impersonate)
+        return session
 
     import cloudscraper
     return cloudscraper.create_scraper(
@@ -169,6 +165,23 @@ def _curl_cffi_impersonations(configured):
     if configured == "chrome131":
         return ("chrome", "chrome136", "chrome133", "chrome131")
     return (configured,)
+
+
+def _create_curl_cffi_session(configured_impersonate):
+    """Create a curl_cffi Session, falling back across impersonation profiles.
+
+    Shared by ArloBackEnd._create_session and _create_auth_helper_session, so
+    the fallback order only has to be right in one place.
+
+    :returns: `(session, impersonate_used)`.
+    """
+    from curl_cffi import requests as cffi_requests
+    for impersonate in _curl_cffi_impersonations(configured_impersonate):
+        try:
+            return cffi_requests.Session(impersonate=impersonate), impersonate
+        except Exception:
+            continue
+    return cffi_requests.Session(impersonate=configured_impersonate), configured_impersonate
 
 
 def _parse_auth_helper_response(response):
@@ -325,7 +338,7 @@ def start_interactive_2fa_auth(
         {
             "email": username,
             "password": to_b64(password),
-            "language": "fr",
+            "language": "en",
             "EnvSource": "prod",
         },
         headers,
@@ -1594,6 +1607,27 @@ class ArloBackEnd(object):
         self.debug(f"PingOne auth selected {factor_type}")
         return factor.get("factorId"), body.get("factorAuthCode")
 
+    def _resolve_secondary_factor(self, headers):
+        """Try PingOne, then fall back to the configured secondary factor.
+
+        _auth() needs this twice: once when the initial AUTH_GET_FACTORID
+        lookup doesn't already have a factor, and again if quick-start
+        (trusted-browser) then also fails.
+
+        :returns: `(factor_id, factor_auth_code)`. `factor_id` is None if
+            neither PingOne nor the secondary-factor list could resolve one -
+            the caller treats that as AuthResult.FAILED.
+        """
+        factor_id, factor_auth_code = self._start_pingone_auth(headers)
+        if factor_id is None:
+            factors = self._get_secondary_factors(headers)
+            if factors is not None:
+                factor = self._select_tfa_factor(factors)
+                if factor is not None:
+                    self._log_selected_tfa_factor(factor)
+                    factor_id = factor.get("factorId")
+        return factor_id, factor_auth_code
+
     def _start_factor_auth(self, headers, factor_id, factor_type):
         self.debug(f"starting auth with {factor_type}")
         self.auth_options(AUTH_START_PATH, headers)
@@ -1656,9 +1690,11 @@ class ArloBackEnd(object):
             if code == 200 or code == 401:
                 break
             # Never burn the remaining attempts on something retrying cannot
-            # fix. It matters most for 9017, where the account is locked for
-            # five minutes and each extra try prolongs it.
+            # fix, or on a temporary lockout (9017, RETRY but not blindly -
+            # each extra try during the 5 minutes only prolongs it).
             if response.action in (ErrorAction.FATAL, ErrorAction.REJECTED):
+                break
+            if response.arlo_error in ACCOUNT_LOCKED:
                 break
             time.sleep(3)
 
@@ -1721,18 +1757,7 @@ class ArloBackEnd(object):
                 factor_id = body["factorId"]
             else:
                 self._needs_pairing = True
-                factor_id, factor_auth_code = self._start_pingone_auth(headers)
-
-            if factor_id is None:
-                factors = self._get_secondary_factors(headers)
-                if factors is None:
-                    self._arlo.error("login failed: 2fa: no secondary choices available")
-                    return AuthResult.FAILED
-
-                factor = self._select_tfa_factor(factors)
-                if factor is not None:
-                    self._log_selected_tfa_factor(factor)
-                    factor_id = factor.get("factorId")
+                factor_id, factor_auth_code = self._resolve_secondary_factor(headers)
 
             if factor_id is None:
                 self._arlo.error("login failed: 2fa: no secondary choices available")
@@ -1746,29 +1771,27 @@ class ArloBackEnd(object):
                     "userId": self._user_id
                 }
                 self.auth_options(AUTH_START_PATH, headers)
-                code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+                start_response = self.auth_post_full(AUTH_START_PATH, payload, headers)
+                code, body = start_response.code, start_response.body
                 if code == 200:
                     quick_start_complete = True
+                elif (
+                    start_response.action in (ErrorAction.FATAL, ErrorAction.REJECTED)
+                    or start_response.arlo_error in ACCOUNT_LOCKED
+                ):
+                    # Same fail-fast guard as the initial auth_post_full() call
+                    # above: falling through to PingOne/secondary-factor
+                    # discovery here is more requests during what is often a
+                    # lockout (9017), which only prolongs it.
+                    self._arlo.error(f"login failed: quick start: {start_response.describe()}")
+                    self._last_auth_action = start_response.action
+                    return AuthResult.FAILED
                 else:
                     self._arlo.warning(
                         f"quick start failed: {code} - {body}; trying configured 2FA"
                     )
                     self._needs_pairing = True
-                    factor_id = None
-                    factor_auth_code = None
-
-                    factor_id, factor_auth_code = self._start_pingone_auth(headers)
-
-                    if factor_id is None:
-                        factors = self._get_secondary_factors(headers)
-                        if factors is None:
-                            self._arlo.error("login failed: 2fa: no secondary choices available")
-                            return AuthResult.FAILED
-
-                        factor = self._select_tfa_factor(factors)
-                        if factor is not None:
-                            self._log_selected_tfa_factor(factor)
-                            factor_id = factor.get("factorId")
+                    factor_id, factor_auth_code = self._resolve_secondary_factor(headers)
 
                     if factor_id is None:
                         self._arlo.error("login failed: 2fa: no secondary choices available")
@@ -2011,17 +2034,10 @@ class ArloBackEnd(object):
     def _create_session(self, curve=None):
         """Create the HTTP session using the configured backend."""
         if self._arlo.cfg.http_backend == "curl_cffi":
-            from curl_cffi import requests as cffi_requests
-            for impersonate in _curl_cffi_impersonations(self._arlo.cfg.curl_cffi_impersonate):
-                try:
-                    self._session = cffi_requests.Session(impersonate=impersonate)
-                    self.debug(f"curl_cffi impersonate={impersonate}")
-                    break
-                except Exception:
-                    continue
-            else:
-                self._session = cffi_requests.Session(impersonate=self._arlo.cfg.curl_cffi_impersonate)
-                self.debug(f"curl_cffi impersonate={self._arlo.cfg.curl_cffi_impersonate}")
+            self._session, impersonate = _create_curl_cffi_session(
+                self._arlo.cfg.curl_cffi_impersonate
+            )
+            self.debug(f"curl_cffi impersonate={impersonate}")
         else:
             import cloudscraper
             self._session = cloudscraper.create_scraper(

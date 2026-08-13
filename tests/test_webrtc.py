@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pyaarlo.camera import ArloCamera, _get_model_capabilities, _model_capabilities_cache
+from pyaarlo.camera import ArloCamera, _get_model_capabilities, _is_rtsp_cloud_url, _model_capabilities_cache
 from pyaarlo.webrtc import (
     ArloWebRtcSession,
     _build_ice_servers,
@@ -148,6 +148,40 @@ def test_get_model_capabilities_handles_failure(monkeypatch):
     assert _get_model_capabilities("UNKNOWNMODEL") is None
 
 
+def test_get_model_capabilities_does_not_cache_a_transient_failure(monkeypatch):
+    # A network blip must not poison the cache for the rest of the process:
+    # the next call has to actually retry, not be served a stale None.
+    calls = []
+
+    def flaky_http_get(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return False
+        return json.dumps({"Capabilities": {"Streaming": {}}}).encode()
+
+    monkeypatch.setattr("pyaarlo.camera.http_get", flaky_http_get)
+
+    assert _get_model_capabilities("VMC4070PA") is None
+    assert _get_model_capabilities("VMC4070PA") == {"Streaming": {}}
+    assert len(calls) == 2
+
+
+def test_get_model_capabilities_does_not_cache_a_malformed_response(monkeypatch):
+    calls = []
+
+    def flaky_http_get(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return b"not json"
+        return json.dumps({"Capabilities": {"Streaming": {}}}).encode()
+
+    monkeypatch.setattr("pyaarlo.camera.http_get", flaky_http_get)
+
+    assert _get_model_capabilities("VMC4070PA") is None
+    assert _get_model_capabilities("VMC4070PA") == {"Streaming": {}}
+    assert len(calls) == 2
+
+
 def test_get_model_capabilities_none_model_id():
     assert _get_model_capabilities(None) is None
     assert _get_model_capabilities("") is None
@@ -225,6 +259,96 @@ def test_unknown_model_capabilities_fetch_failed(monkeypatch):
     _patch_capabilities(monkeypatch, {})
     cam = _fake_camera("VMC3030", "AKB1", "AKB1")
     assert cam.supports_sip_webrtc_streaming(cam) is False
+
+
+# ---------------------------------------------------------------------------
+# _start_stream() - must not hand a local SIP/WebRTC relay URL (or a stale
+# None left over from a dead session) to a caller expecting a genuine
+# RTSP-cloud URL, and must not clobber a live WebRTC session's own URL.
+# ---------------------------------------------------------------------------
+
+def test_is_rtsp_cloud_url():
+    assert _is_rtsp_cloud_url("rtsp://x") is True
+    assert _is_rtsp_cloud_url("rtsps://x") is True
+    assert _is_rtsp_cloud_url("tcp://127.0.0.1:1234") is False
+    assert _is_rtsp_cloud_url(None) is False
+    assert _is_rtsp_cloud_url("") is False
+
+
+def _fake_camera_for_start_stream(stream_url, webrtc_session=None, posted_url="rtsp://cloud.example/stream"):
+    cam = SimpleNamespace()
+    cam._lock = threading.Condition()
+    cam._local_users = {"streaming"}
+    cam._stream_url = stream_url
+    cam._webrtc_session = webrtc_session
+    cam.has_any_local_users = True
+    cam.is_taking_idle_snapshot = False
+    cam._dump_activities = MagicMock()
+    cam.debug = MagicMock()
+    cam.web_id = "USER-1_web"
+    cam.device_id = "CAM-1"
+    cam.resource_id = "cameras/CAM-1"
+    cam.parent_id = "BASE-1"
+    cam.xcloud_id = "xcloud"
+    post = MagicMock(return_value={"url": posted_url} if posted_url is not None else None)
+    cam._arlo = SimpleNamespace(
+        be=SimpleNamespace(post=post, gen_trans_id=lambda: "T1", user_agent=lambda a: a)
+    )
+    return cam, post
+
+
+def test_start_stream_reuses_a_cached_rtsp_cloud_url():
+    cam, post = _fake_camera_for_start_stream("rtsps://existing.example/stream")
+
+    url = ArloCamera._start_stream(cam, "snapshot")
+
+    assert url == "rtsps://existing.example/stream"
+    post.assert_not_called()
+
+
+def test_start_stream_does_not_reuse_a_stale_webrtc_relay_url():
+    # Regression: a live SIP/WebRTC "streaming" session's local relay URL
+    # (tcp://127.0.0.1:port) is not something a snapshot/recording caller can
+    # use - it must get a genuine RTSP-cloud URL instead of this one verbatim.
+    cam, post = _fake_camera_for_start_stream("tcp://127.0.0.1:1234")
+
+    url = ArloCamera._start_stream(cam, "snapshot")
+
+    post.assert_called_once()
+    assert url == "rtsps://cloud.example/stream"
+
+
+def test_start_stream_issues_a_fresh_request_after_a_dead_webrtc_session():
+    # Regression: when a live WebRTC session dies and the leftover "streaming"
+    # entry stays in _local_users, self._stream_url is None (cleared by the
+    # fallback path) - the old code returned None verbatim here instead of
+    # issuing a fresh RTSP-cloud request.
+    cam, post = _fake_camera_for_start_stream(None)
+
+    url = ArloCamera._start_stream(cam, "snapshot")
+
+    post.assert_called_once()
+    assert url == "rtsps://cloud.example/stream"
+
+
+def test_start_stream_does_not_clobber_a_live_webrtc_sessions_url():
+    live_session = SimpleNamespace(is_alive=True)
+    cam, post = _fake_camera_for_start_stream("tcp://127.0.0.1:1234", webrtc_session=live_session)
+
+    url = ArloCamera._start_stream(cam, "snapshot")
+
+    post.assert_called_once()
+    assert url == "rtsps://cloud.example/stream"
+    # The live session's own URL must survive untouched.
+    assert cam._stream_url == "tcp://127.0.0.1:1234"
+
+
+def test_start_stream_updates_stream_url_when_no_live_webrtc_session():
+    cam, post = _fake_camera_for_start_stream("tcp://127.0.0.1:1234", webrtc_session=None)
+
+    url = ArloCamera._start_stream(cam, "snapshot")
+
+    assert cam._stream_url == url == "rtsps://cloud.example/stream"
 
 
 # ---------------------------------------------------------------------------

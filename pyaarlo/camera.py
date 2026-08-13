@@ -91,25 +91,48 @@ from .device import ArloChildDevice
 from .util import http_get, http_get_img, the_epoch
 from .webrtc_common import build_ice_server_kwargs
 
+def _is_rtsp_cloud_url(url):
+    """Whether `url` is a genuine Arlo RTSP-cloud URL, not a local relay.
+
+    A SIP/WebRTC session's URL is `tcp://127.0.0.1:{port}` (see webrtc.py),
+    which only means anything for as long as that one aiortc session lives -
+    it is not interchangeable with an RTSP-cloud URL for a different caller
+    (snapshot/recording) to use independently.
+    """
+    return isinstance(url, str) and url.startswith(("rtsp://", "rtsps://"))
+
+
 _model_capabilities_cache = {}
+_model_capabilities_lock = threading.Lock()
 
 
 def _get_model_capabilities(model_id):
-    """Fetch and cache the public per-model capability document."""
+    """Fetch and cache the public per-model capability document.
+
+    A failed fetch or a malformed response is deliberately not cached: this
+    cache is a plain module-level dict with no expiry, so caching `None` for
+    a transient network blip would keep answering "no capabilities" for the
+    rest of the process's lifetime, well after the network problem that
+    caused it is gone. Only a genuine, successfully parsed answer from Arlo -
+    even one where the model simply has no capabilities listed - is cached.
+    """
     if not model_id:
         return None
     model_key = model_id.lower()
-    if model_key in _model_capabilities_cache:
-        return _model_capabilities_cache[model_key]
+    with _model_capabilities_lock:
+        if model_key in _model_capabilities_cache:
+            return _model_capabilities_cache[model_key]
 
-    caps = None
     data = http_get(CAPABILITIES_URL.format(model=model_key))
-    if data:
-        try:
-            caps = json.loads(data).get("Capabilities")
-        except (ValueError, AttributeError):
-            caps = None
-    _model_capabilities_cache[model_key] = caps
+    if not data:
+        return None
+    try:
+        caps = json.loads(data).get("Capabilities")
+    except (ValueError, AttributeError):
+        return None
+
+    with _model_capabilities_lock:
+        _model_capabilities_cache[model_key] = caps
     return caps
 
 
@@ -134,7 +157,7 @@ class ArloCamera(ArloChildDevice):
         # active SIP/WebRTC live-view session, if any (see webrtc.py)
         self._webrtc_session = None
         self._webrtc_starting = False
-        # ICE servers from the most recent successful _get_sip_info(), if any.
+        # ICE servers from the most recent successful get_sip_info(), if any.
         # Exposed synchronously via cached_ice_servers so a caller that can't
         # block on a network call (e.g. a Home Assistant @callback) can still
         # get a recent set of Arlo's own TURN/STUN servers.
@@ -374,8 +397,11 @@ class ArloCamera(ArloChildDevice):
         self.debug("SIP/WebRTC startUserStream activity response={}".format(response))
         return response is not None
 
-    def _get_sip_info(self):
+    def get_sip_info(self):
         """Fetch the SIP/WebRTC call info needed to negotiate the newer live-view path.
+
+        Public: called both from webrtc.py's own aiortc path and from hass-aarlo's
+        native browser-relay path (ArloWebRtcCam), across the package boundary.
 
         Returns a dict with `sipCallInfo` (id/password/domain/calleeUri/...) and
         `iceServers`, or None on failure. These credentials are single-use: a fresh
@@ -398,7 +424,7 @@ class ArloCamera(ArloChildDevice):
 
     @property
     def cached_ice_servers(self):
-        """ICE server kwargs from the most recent successful `_get_sip_info()`.
+        """ICE server kwargs from the most recent successful `get_sip_info()`.
 
         `[]` if a live-view attempt has never been made. Plain dicts
         (`urls`/`username`/`credential`), not a webrtc_models/aiortc type -
@@ -440,8 +466,14 @@ class ArloCamera(ArloChildDevice):
 
     def _start_stream(self, starting_for, user_agent=None):
         with self._lock:
-            # Already streaming. Update sub-activity as needed.
-            if self.has_any_local_users:
+            # Already streaming, and with a URL any caller can use. A live
+            # SIP/WebRTC session's URL is a local relay (tcp://127.0.0.1:port,
+            # see webrtc.py) rather than a genuine Arlo RTSP-cloud URL, and it
+            # is only valid for as long as that specific session lives - a
+            # snapshot/recording caller getting it instead of a real
+            # RTSP-cloud URL would be handed something that isn't what it
+            # asked for. Fall through and get a proper one instead.
+            if self.has_any_local_users and _is_rtsp_cloud_url(self._stream_url):
                 self._local_users.add(starting_for)
                 self._dump_activities("_start_stream")
                 return self._stream_url
@@ -470,14 +502,22 @@ class ArloCamera(ArloChildDevice):
         if user_agent is not None:
             headers["User-Agent"] = self._arlo.be.user_agent(user_agent)
 
-        self._stream_url = self._arlo.be.post(STREAM_START_PATH, body, headers=headers)
-        if self._stream_url is not None:
-            self._stream_url = self._stream_url["url"].replace("rtsp://", "rtsps://").replace("__/playlist.m3u8", "")
-            self.debug("url={}".format(self._stream_url))
-        else:
+        posted = self._arlo.be.post(STREAM_START_PATH, body, headers=headers)
+        if posted is None:
             with self._lock:
                 self._local_users = set()
-        return self._stream_url
+            return None
+
+        url = posted["url"].replace("rtsp://", "rtsps://").replace("__/playlist.m3u8", "")
+        self.debug("url={}".format(url))
+        with self._lock:
+            # Don't clobber a live SIP/WebRTC session's own relay URL with
+            # this unrelated RTSP-cloud one - _start_stream_with_webrtc_
+            # fallback's reuse check depends on self._stream_url staying the
+            # session's own URL for as long as that session is alive.
+            if self._webrtc_session is None or not self._webrtc_session.is_alive:
+                self._stream_url = url
+        return url
 
     def _stop_stream(self, stopping_for="streaming"):
         webrtc_session = None

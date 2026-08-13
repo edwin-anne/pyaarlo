@@ -82,11 +82,25 @@ AUTH_PENDING = frozenset({9233, 9276, 9278, 9306, 9307})
 # --- Permanent, do not retry ------------------------------------------------
 #   9001 invalid email address        9004 authentication failed for credentials
 #   9015 password not correct         9016 account not found
-#   9017 account locked (5 minutes)   9019 email and password do not match
+#   9019 email and password do not match
 #   9058 invalid email address        9340 password expired
-# 9017 is the reason retrying blindly is actively harmful: hammering the API
-# during a lockout keeps extending it.
-FATAL_AUTH = frozenset({9001, 9004, 9015, 9016, 9017, 9019, 9058, 9340})
+# Retrying any of these can never succeed: the credentials themselves need to
+# change, which is why hass-aarlo turns this into a "Reconfigure" card rather
+# than an automatic retry.
+FATAL_AUTH = frozenset({9001, 9004, 9015, 9016, 9019, 9058, 9340})
+
+# --- Temporary lockout, retry after it expires -------------------------------
+#   9017 account locked (5 minutes)
+# Not permanent like the codes above - the account unlocks itself - so this is
+# RETRY, not FATAL: FATAL sends the user to a "Reconfigure" card even though
+# nothing about their credentials is wrong, and RETRY lets Home Assistant's own
+# ConfigEntryNotReady backoff recover unattended once the 5 minutes pass.
+# Callers that blind-retry immediately (a handful of login attempts a few
+# seconds apart, before this classification is even visible) still need to
+# special-case 9017 themselves: retrying *at all* during the lockout window
+# keeps extending it, which RETRY's normal backoff is too slow to prevent on
+# its own for the first few seconds.
+ACCOUNT_LOCKED = frozenset({9017})
 
 # --- A new one-time code is required ---------------------------------------
 #   9234/9301 code retry limit exceeded, resend and try again
@@ -198,6 +212,8 @@ def classify(http_code, arlo_error=None):
             return ErrorAction.REAUTH
         if arlo_error in AUTH_PENDING:
             return ErrorAction.AUTH_PENDING
+        if arlo_error in ACCOUNT_LOCKED:
+            return ErrorAction.RETRY
         if arlo_error in FATAL_AUTH:
             return ErrorAction.FATAL
         if arlo_error in OTP_ERRORS:

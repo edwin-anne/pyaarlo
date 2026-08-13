@@ -79,6 +79,13 @@ MODE_UPDATE_INTERVAL = 2
 EVENT_LOGIN_RETRY_MIN = 5
 EVENT_LOGIN_RETRY_MAX = 300
 
+# How long a base station's ping is allowed to stay inconclusive (session
+# rejected, reauth under way) before falling back to reporting it unavailable.
+# Matches EVENT_LOGIN_RETRY_MAX: by the time the login backoff has fully
+# ramped up, "still reauthing" and "actually stuck" are no longer
+# distinguishable from here, so the ping's own fail-safe should kick in.
+PING_REAUTH_UNAVAILABLE_GRACE = 300
+
 # MQTT CONNACK result codes we have to act on. The broker password is the Arlo
 # session token, so these mean the token is gone, not that the broker is unwell.
 MQTT_RC_BAD_CREDENTIALS = 4

@@ -82,8 +82,14 @@ class TestClassify(TestCase):
             )
 
     def test_credential_errors_are_fatal(self):
-        for code in (9001, 9004, 9015, 9016, 9017, 9019, 9058, 9340):
+        for code in (9001, 9004, 9015, 9016, 9019, 9058, 9340):
             self.assertEqual(classify(400, code), ErrorAction.FATAL, f"code {code}")
+
+    def test_account_lockout_is_retryable_not_fatal(self):
+        # 9017 unlocks itself after 5 minutes, unlike the codes above where the
+        # credentials themselves have to change. FATAL would send the user to a
+        # "Reconfigure" card for nothing.
+        self.assertEqual(classify(400, 9017), ErrorAction.RETRY)
 
     def test_otp_errors_ask_for_a_new_code(self):
         for code in (9234, 9236, 9237, 9238, 9243, 9301):
@@ -214,7 +220,7 @@ class TestParseAuthHelperResponse(TestCase):
             FakeResponse(401, {"meta": {"code": 401, "error": 9017, "message": "locked"}})
         )
         self.assertEqual(result.arlo_error, 9017)
-        self.assertEqual(result.action, ErrorAction.FATAL)
+        self.assertEqual(result.action, ErrorAction.RETRY)
 
     def test_malformed_envelope_does_not_raise(self):
         result = self._parse(FakeResponse(200, {"meta": {"code": 400}}))

@@ -80,7 +80,7 @@ async def _open_signaling_socket(domain_with_port):
 async def async_negotiate_offer(sip_call_info, device_id, offer_sdp, arlo_session_id=None):
     """Send a browser's SDP offer to Arlo and return its SDP answer.
 
-    :param sip_call_info: the `sipCallInfo` dict from `ArloCamera._get_sip_info()`.
+    :param sip_call_info: the `sipCallInfo` dict from `ArloCamera.get_sip_info()`.
     :param device_id: the camera's device id (fallback if sipCallInfo lacks one).
     :param offer_sdp: the offer exactly as the browser produced it - no rewriting.
     :param arlo_session_id: reuse an existing Arlo-side session id, or generate

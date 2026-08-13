@@ -2,11 +2,13 @@ import os
 import pickle
 import tempfile
 import threading
+import time
 from http.cookiejar import LWPCookieJar
 from unittest import TestCase
 
 import tests.arlo
 from pyaarlo.backend import ArloBackEnd, AuthResult
+from pyaarlo.constant import PING_REAUTH_UNAVAILABLE_GRACE
 from pyaarlo.errors import ArloResponse, ErrorAction
 from pyaarlo.sseclient import SSEStatusError
 
@@ -202,6 +204,68 @@ class TestManualTfaIsFatal(BackendFixture):
         self.assertEqual(result, AuthResult.FAILED)
         self.assertEqual(self.be._last_auth_action, ErrorAction.FATAL)
         self.assertTrue(self.be.auth_failed_permanently)
+
+
+class TestAccountLockoutFailsFast(BackendFixture):
+    """Field regression: 9017 (temporary lockout) is classified RETRY, not
+    FATAL, since it unlocks itself - but blind-retrying immediately still
+    extends the lockout, so the login loop must not burn its remaining
+    blind-retry attempts on it either.
+    """
+
+    def test_top_level_login_does_not_blind_retry_a_lockout(self):
+        self.be._user_agent = "linux"
+        self.be.auth_options = lambda *a, **k: None
+        calls = []
+
+        def _auth_post_full(*a, **k):
+            calls.append(1)
+            return ArloResponse(400, "locked", arlo_error=9017, action=ErrorAction.RETRY)
+
+        self.be.auth_post_full = _auth_post_full
+
+        result = self.be._auth()
+
+        self.assertEqual(result, AuthResult.FAILED)
+        self.assertEqual(self.be._last_auth_action, ErrorAction.RETRY)
+        self.assertEqual(len(calls), 1, "must not burn the blind-retry attempts on a lockout")
+
+
+class TestQuickStartFailsFast(BackendFixture):
+    """Field regression: a locked account (9017) discovered during quick-start
+    (trusted-browser) 2FA used to fall through to PingOne/secondary-factor
+    discovery calls before failing - more requests during exactly the
+    condition where every extra request prolongs the lockout - instead of
+    aborting immediately like the initial login call already does.
+    """
+
+    def test_locked_account_during_quick_start_aborts_immediately(self):
+        self.be._arlo.cfg._kw["tfa_source"] = "console"
+        self.be._user_agent = "linux"
+        self.be.auth_options = lambda *a, **k: None
+
+        full_responses = iter([
+            ArloResponse(
+                200,
+                {"authCompleted": False, "userId": "u", "token": "t", "expiresIn": 1},
+                action=ErrorAction.OK,
+            ),
+            ArloResponse(400, "locked", arlo_error=9017, action=ErrorAction.RETRY),
+        ])
+        self.be.auth_post_full = lambda *a, **k: next(full_responses)
+        self.be.auth_post = lambda *a, **k: (200, {"factorId": "F1"})
+
+        pingone_called = []
+        factors_called = []
+        self.be._start_pingone_auth = lambda *a, **k: (pingone_called.append(1), (None, None))[1]
+        self.be._get_secondary_factors = lambda *a, **k: (factors_called.append(1), None)[1]
+
+        result = self.be._auth()
+
+        self.assertEqual(result, AuthResult.FAILED)
+        self.assertEqual(self.be._last_auth_action, ErrorAction.RETRY)
+        self.assertFalse(pingone_called, "must not fall through to PingOne discovery during a lockout")
+        self.assertFalse(factors_called, "must not fall through to secondary-factor discovery either")
 
 
 class TestV2Session(BackendFixture):
@@ -426,6 +490,7 @@ class TestPingClassification(BackendFixture):
         self.base._arlo = self.be._arlo
         self.base._id = "BASE-1"
         self.base._name = "Base"
+        self.base._reauth_since = None
         self.saved = []
         self.base._save_and_do_callbacks = lambda key, value: self.saved.append(
             (key, value)
@@ -458,6 +523,24 @@ class TestPingClassification(BackendFixture):
         )
         self.base._ping_and_check_reply()
         self.assertEqual(self.saved, [])
+
+    def test_rejected_session_eventually_falls_back_to_unavailable(self):
+        # Leaving availability untouched forever is its own bug if the
+        # session never comes back - a stuck reauth, or an extended 9017
+        # lockout, would otherwise leave a genuinely offline base station
+        # reporting stale "available" state indefinitely.
+        self._ping_returns(
+            ArloResponse(401, None, arlo_error=9002, action=ErrorAction.REAUTH)
+        )
+        self.base._reauth_since = time.monotonic() - PING_REAUTH_UNAVAILABLE_GRACE - 1
+        self.base._ping_and_check_reply()
+        self.assertEqual(self.saved, [("connectionState", "unavailable")])
+
+    def test_recovering_resets_the_reauth_clock(self):
+        self.base._reauth_since = time.monotonic() - PING_REAUTH_UNAVAILABLE_GRACE - 1
+        self._ping_returns(ArloResponse(200, {}))
+        self.base._ping_and_check_reply()
+        self.assertIsNone(self.base._reauth_since)
 
     def test_transient_failure_is_still_unavailable(self):
         self._ping_returns(ArloResponse(503, None, action=ErrorAction.RETRY))
