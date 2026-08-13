@@ -561,6 +561,25 @@ class PyArlo(object):
         return self._be.is_connected
 
     @property
+    def last_auth_action(self):
+        """How the last login attempt failed, as an `ErrorAction`.
+
+        `last_error` is only a message, so a caller could not tell a momentary
+        outage from wrong credentials. Use this to decide whether retrying is
+        worth anything.
+        """
+        return self._be.last_auth_action
+
+    @property
+    def auth_failed_permanently(self):
+        """`True` when logging in cannot succeed without user intervention.
+
+        The password is wrong or expired, or the account is locked. Retrying
+        makes a lockout worse, so callers should ask the user instead.
+        """
+        return self._be.auth_failed_permanently
+
+    @property
     def cameras(self):
         """List of registered cameras.
 
