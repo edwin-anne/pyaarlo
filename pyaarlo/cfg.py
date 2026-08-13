@@ -262,6 +262,10 @@ class ArloCfg(object):
         return self._kw.get("tfa_nickname", self.tfa_username)
 
     @property
+    def tfa_factor_id(self):
+        return self._kw.get("tfa_factor_id", None)
+
+    @property
     def wait_for_initial_setup(self):
         return self._kw.get("wait_for_initial_setup", True)
 
