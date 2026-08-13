@@ -318,6 +318,12 @@ class ArloCfg(object):
         return self._kw.get("stream_snapshot_stop", 10)
 
     @property
+    def disable_sip_webrtc_streaming(self):
+        """Force the RTSP-cloud path even for cameras that advertise the
+        newer SIP/WebRTC live-view path. Opt-out switch in case it misbehaves."""
+        return self._kw.get("disable_sip_webrtc_streaming", False)
+
+    @property
     def save_media_to(self):
         return self._kw.get("save_media_to", "")
 
