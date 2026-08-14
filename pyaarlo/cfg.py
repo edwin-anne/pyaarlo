@@ -13,6 +13,7 @@ from .constant import (
     TFA_DEFAULT_HOST,
     TFA_DELAY,
     TFA_EMAIL_TYPE,
+    TFA_PUSH_TIMEOUT,
     TFA_RETRIES,
     ECDH_CURVES
 )
@@ -219,6 +220,23 @@ class ArloCfg(object):
         return self._kw.get("tfa_retries", TFA_RETRIES)
 
     @property
+    def tfa_push_poll(self):
+        """Seconds between checks while waiting for a push to be approved."""
+        return self._kw.get("tfa_push_poll", self.tfa_delay)
+
+    @property
+    def tfa_push_timeout(self):
+        """Seconds to wait for the user to approve the push on their phone.
+
+        `tfa_retries` was the old way of expressing this, as a count rather
+        than a duration. It still wins if it was set explicitly, but its
+        default gave you only 25 seconds to reach for your phone.
+        """
+        if "tfa_retries" in self._kw:
+            return self._kw["tfa_retries"] * self.tfa_push_poll
+        return self._kw.get("tfa_push_timeout", TFA_PUSH_TIMEOUT)
+
+    @property
     def tfa_timeout(self):
         return self._kw.get("tfa_timeout", 3)
 
@@ -262,6 +280,14 @@ class ArloCfg(object):
         return self._kw.get("tfa_nickname", self.tfa_username)
 
     @property
+    def tfa_factor_id(self):
+        """Send the 2FA code to this exact factor, ignoring type and nickname.
+
+        Use `PyArlo.tfa_factors()` or `pyaarlo list-2fa` to find the ids.
+        """
+        return self._kw.get("tfa_factor_id", None)
+
+    @property
     def wait_for_initial_setup(self):
         return self._kw.get("wait_for_initial_setup", True)
 
@@ -282,6 +308,14 @@ class ArloCfg(object):
     @property
     def save_session(self):
         return self._kw.get("save_session", True)
+
+    @property
+    def reuse_session(self):
+        """Reuse the saved token instead of logging in again when it's still good.
+
+        Needs `save_session`, there is nothing to reuse without it.
+        """
+        return self.save_session and self._kw.get("reuse_session", True)
 
     @property
     def cookies_file(self):

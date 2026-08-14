@@ -6,7 +6,7 @@ import pprint
 import threading
 import time
 
-from .backend import ArloBackEnd
+from .backend import ArloBackEnd, LoginStep
 from .background import ArloBackground
 from .base import ArloBase
 from .camera import ArloCamera
@@ -46,6 +46,7 @@ from .constant import (
 )
 from .doorbell import ArloDoorBell
 from .light import ArloLight
+from .login import ArloLogin
 from .media import ArloMediaLibrary
 from .storage import ArloStorage
 from .location import ArloLocation
@@ -80,6 +81,11 @@ class PyArlo(object):
       you can lower this value.
     * **save_state** - Store device state across restarts. Default `True`.
     * **state_file** - Where to store state. Default is `${storage_dir}/${name.}pickle`
+    * **save_session** - Store the login token across restarts. Default `True`.
+    * **reuse_session** - Carry on with the saved token while it is still valid rather than sending
+      the password again. Default `True`. Needs `save_session`. Arlo tokens last about two hours, so
+      this covers restarts and event stream reconnects inside that window. Turning it off means a
+      full login every time.
     * **refresh_devices_every** - Time, in hours, to refresh the device list from Arlo. This can help keep the login
       from timing out.
     * **stream_timeout** - Time, in seconds, for the event stream to close after receiving no packets. 0 means
@@ -100,11 +106,18 @@ class PyArlo(object):
 
     These parameters are needed for 2FA.
 
-    * **tfa_source** - Where to get the token from. Default is `console`. Can be `imap` to use email or
-      `rest-api` to use rest API website.
-    * **tfa_type** - How to get the 2FA token delivered. Default is `email` but can be `sms`.
+    * **tfa_source** - Where to get the token from. Default is `console`. Can be `imap` to use email,
+      `rest-api` to use rest API website, or `push` to approve the login from the Arlo phone app.
+    * **tfa_type** - How to get the 2FA token delivered. Default is `email` but can be `sms` or `push`.
+    * **tfa_factor_id** - Send the token to this exact factor, ignoring `tfa_type` and `tfa_nickname`.
+      Use `PyArlo.tfa_factors()` or `pyaarlo list-2fa` to find the ids. Needed if the account has more
+      than one factor of the same type.
+    * **tfa_nickname** - Match the factor with this nickname. Only used when `tfa_factor_id` is unset.
     * **tfa_timeout** - When using `imap` or `rest-api`, how long to wait, in seconds, between checks.
     * **tfa_total_timeout** - When using `imap` or `rest-api`, how long to wait, in seconds, for all checks.
+    * **tfa_push_timeout** - When using `push`, how long to wait, in seconds, for the login to be
+      approved on the phone. Default 300, which is what the Arlo web app allows.
+    * **tfa_push_poll** - When using `push`, how often to check, in seconds. Default 5.
     * **tfa_host** - When using `imap` or `rest-api`, host name of server.
     * **tfa_username** - When using `imap` or `rest-api`, user name on server. If `None` will use
       Arlo username.
@@ -565,6 +578,20 @@ class PyArlo(object):
     def is_connected(self):
         """Returns `True` if the object is connected to the Arlo servers, `False` otherwise."""
         return self._be.is_connected
+
+    def tfa_factors(self):
+        """List the 2FA factors configured on the Arlo account.
+
+        Each entry carries at least `factorId`, `factorType` - `EMAIL`, `SMS`
+        or `PUSH` - `factorRole` and `factorNickname`. Pass a `factorId` back in
+        as the `tfa_factor_id` option to send future codes to that exact factor,
+        which is the only reliable way to choose when an account has more than
+        one factor of the same type.
+
+        :return: a list of factors, or `None` if they couldn't be read.
+        :rtype: list(dict)
+        """
+        return self._be.tfa_factors()
 
     @property
     def cameras(self):

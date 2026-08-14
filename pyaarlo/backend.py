@@ -19,6 +19,7 @@ from enum import IntEnum
 from http.cookiejar import LWPCookieJar
 
 from .constant import (
+    AUTH_UNTRUSTED_ERRORS,
     AUTH_FINISH_PATH,
     AUTH_GET_FACTORID,
     AUTH_GET_FACTORS,
@@ -39,20 +40,41 @@ from .constant import (
     SUBSCRIBE_PATH,
     TFA_CONSOLE_SOURCE,
     TFA_IMAP_SOURCE,
+    TFA_PUSH_DENIED_ERROR,
     TFA_PUSH_SOURCE,
+    TFA_PUSH_TYPE,
     TFA_REST_API_SOURCE,
+    TFA_SOURCES,
+    TOKEN_MIN_SECONDS_LEFT,
     TRANSID_PREFIX,
     USER_AGENTS,
 )
 from .sseclient import SSEClient
 from .tfa import Arlo2FAConsole, Arlo2FAImap, Arlo2FARestAPI
-from .util import days_until, now_strftime, time_to_arlotime, to_b64
+from .util import now_strftime, seconds_until, time_to_arlotime, to_b64
 
 
 class AuthResult(IntEnum):
     CAN_RETRY = -1,
     SUCCESS = 0,
     FAILED = 1
+
+
+class LoginStep(IntEnum):
+    """Where an interactive `login_*` call has left the login.
+
+    `SUCCESS` - logged in, nothing more to do.
+    `NEEDS_FACTOR` - call `login_choose_factor()` with one of `login_factors`.
+    `AWAITING_PUSH` - call `login_poll_push()` again after `tfa_push_poll`
+      seconds, until it stops returning this.
+    `AWAITING_CODE` - call `login_submit_code()` with the code the user typed.
+    `FAILED` - could not log in, see `last_error`.
+    """
+    FAILED = 0
+    SUCCESS = 1
+    NEEDS_FACTOR = 2
+    AWAITING_PUSH = 3
+    AWAITING_CODE = 4
 
 
 # include token and session details
@@ -67,10 +89,19 @@ class ArloBackEnd(object):
     _web_id: str | None = None
     _sub_id: str | None = None
     _token: str | None = None
+    _token64: str | None = None
     _expires_in: int | None = None
     _needs_pairing: bool = False
 
-    def __init__(self, arlo):
+    # State for an interactive login in progress, driven by the `login_*`
+    # methods rather than the classic blocking `_login()`.
+    _login_factors: list | None = None
+    _login_factor: dict | None = None
+    _login_factor_auth_code: str | None = None
+    _login_headers: dict | None = None
+    _login_push_deadline: float | None = None
+
+    def __init__(self, arlo, auto_login=True):
 
         self._arlo = arlo
         self._lock = threading.Condition()
@@ -97,16 +128,27 @@ class ArloBackEnd(object):
         # login
         self._session = None
         self._load_cookies()
-        self._logged_in = self._login()
-        if not self._logged_in:
-            self.debug("failed to log in")
-            return
+        if auto_login:
+            self._logged_in = self._login()
+            if not self._logged_in:
+                self.debug("failed to log in")
+                return
+        else:
+            # Caller drives the login themselves through the `login_*`
+            # methods, e.g. an interactive setup flow that needs to show the
+            # user their 2FA factors before picking one.
+            self._logged_in = False
+
+    def _set_token(self, token):
+        """Set the token, keeping the base64 flavour the auth API wants in step."""
+        self._token = token
+        self._token64 = to_b64(token) if token is not None else None
 
     def _load_session(self):
         self._user_id = None
         self._web_id = None
         self._sub_id = None
-        self._token = None
+        self._set_token(None)
         self._expires_in = 0
         self._browser_auth_code = None
         self._user_device_id = None
@@ -129,7 +171,7 @@ class ArloBackEnd(object):
                         self._user_id = session_info["user_id"]
                         self._web_id = session_info["web_id"]
                         self._sub_id = session_info["sub_id"]
-                        self._token = session_info["token"]
+                        self._set_token(session_info["token"])
                         self._expires_in = session_info["expires_in"]
                         if "browser_auth_code" in session_info:
                             self._browser_auth_code = session_info["browser_auth_code"]
@@ -164,7 +206,7 @@ class ArloBackEnd(object):
         except Exception as e:
             self._arlo.warning("session file not written" + str(e))
 
-    def _save_cookies(self, requests_cookiejar):
+    def _save_cookies(self):
         if self._cookies is not None:
             self.debug(f"saving-cookies={self._cookies}")
             self._cookies.save(ignore_discard=True)
@@ -172,9 +214,14 @@ class ArloBackEnd(object):
     def _load_cookies(self):
         self._cookies = LWPCookieJar(self._arlo.cfg.cookies_file)
         try:
-            self._cookies.load()
-        except:
-            pass
+            # Must match the ignore_discard we save with. Arlo's browser trust
+            # cookie has no expiry, so loading without this reads it back as
+            # nothing and we get asked for a 2FA code on every restart.
+            self._cookies.load(ignore_discard=True)
+        except FileNotFoundError:
+            self.debug("no cookie file yet")
+        except Exception as e:
+            self._arlo.warning(f"cookie file not read: {e}")
         self.debug(f"loading cookies={self._cookies}")
 
     def _transaction_id(self):
@@ -271,7 +318,7 @@ class ArloBackEnd(object):
                 return 200, body["data"]
             else:
                 # don't warn on untrusted errors, they just mean we need to log in
-                if body["meta"]["error"] != 9204:
+                if body["meta"]["error"] not in AUTH_UNTRUSTED_ERRORS:
                     self._arlo.warning("error in new response=" + str(body))
                 return int(body["meta"]["code"]), body["meta"]["message"]
 
@@ -736,22 +783,109 @@ class ArloBackEnd(object):
         return True
     
     def _get_tfa(self):
-        """Return the 2FA type we're using."""
-        tfa_type = self._arlo.cfg.tfa_source
-        if tfa_type == TFA_CONSOLE_SOURCE:
+        """Return the 2FA handler we're using, or `None` if it isn't configured."""
+        tfa_source = self._arlo.cfg.tfa_source
+        if tfa_source == TFA_CONSOLE_SOURCE:
             return Arlo2FAConsole(self._arlo)
-        elif tfa_type == TFA_IMAP_SOURCE:
+        elif tfa_source == TFA_IMAP_SOURCE:
             return Arlo2FAImap(self._arlo)
-        elif tfa_type == TFA_REST_API_SOURCE:
+        elif tfa_source == TFA_REST_API_SOURCE:
             return Arlo2FARestAPI(self._arlo)
-        else:
-            return tfa_type
+        elif tfa_source == TFA_PUSH_SOURCE:
+            # Push has no handler, Arlo asks the phone app directly and we just
+            # wait for the user to tap approve.
+            return TFA_PUSH_SOURCE
+        self._arlo.error(
+            "unknown tfa_source '{}', expected one of: {}".format(
+                tfa_source, ", ".join(TFA_SOURCES)
+            )
+        )
+        return None
+
+    @staticmethod
+    def _describe_factor(factor):
+        """One line description of a 2FA factor, for logs and listings."""
+        return "{}/{} ({})".format(
+            factor.get("factorType", "?"),
+            factor.get("displayName") or factor.get("factorNickname") or "?",
+            factor.get("factorId", "?"),
+        )
+
+    def _get_factors(self, headers=None):
+        """Return the 2FA factors Arlo has on file, or `None` if we can't read them.
+
+        Needs a token - either a part authenticated one from the middle of a
+        login, or a full one once we're in.
+        """
+        if headers is None:
+            headers = self._auth_headers()
+            headers["Authorization"] = self._token64
+        code, body = self.auth_get_tuple(
+            AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
+        )
+        if code != 200:
+            self._arlo.error(f"2fa: unable to read the factor list: {code} - {body}")
+            return None
+        return body.get("items", [])
+
+    def _select_factor(self, factors):
+        """Pick the 2FA factor Arlo should send the code to.
+
+        `tfa_factor_id` wins outright. It names one exact factor, which is the
+        only reliable way to choose when an account has several of the same
+        type - two phones, or a work and a home email. Without it we fall back
+        to matching on `tfa_type` and then `tfa_nickname`.
+        """
+        known = ", ".join(self._describe_factor(f) for f in factors)
+
+        wanted_id = self._arlo.cfg.tfa_factor_id
+        if wanted_id is not None:
+            for factor in factors:
+                if factor.get("factorId") == wanted_id:
+                    self.debug(f"2fa: using {self._describe_factor(factor)}")
+                    return factor
+            self._arlo.error(
+                f"2fa: no factor with id {wanted_id}, this account has: {known}"
+            )
+            return None
+
+        wanted_type = self._arlo.cfg.tfa_type
+        of_type = [
+            f for f in factors if f.get("factorType", "").lower() == wanted_type
+        ]
+        if not of_type:
+            self._arlo.error(
+                f"2fa: no {wanted_type} factor, this account has: {known}"
+            )
+            return None
+
+        nickname = self._arlo.cfg.tfa_nickname
+        for factor in of_type:
+            if factor.get("factorNickname") == nickname:
+                self.debug(f"2fa: using {self._describe_factor(factor)}")
+                return factor
+
+        if len(of_type) > 1:
+            self._arlo.warning(
+                f"2fa: no {wanted_type} factor nicknamed '{nickname}', falling back "
+                f"to {self._describe_factor(of_type[0])} - set tfa_factor_id to choose"
+            )
+        self.debug(f"2fa: using {self._describe_factor(of_type[0])}")
+        return of_type[0]
+
+    def tfa_factors(self):
+        """Return the 2FA factors configured on the account.
+
+        Each entry carries at least `factorId`, `factorType`, `factorRole` and
+        `factorNickname`. Feed a `factorId` back in as `tfa_factor_id` to pin
+        the login to that one factor.
+        """
+        return self._get_factors()
 
     def _update_auth_info(self, body):
         if "accessToken" in body:
             body = body["accessToken"]
-        self._token = body["token"]
-        self._token64 = to_b64(self._token)
+        self._set_token(body["token"])
         self._user_id = body["userId"]
         self._web_id = self._user_id + "_web"
         self._sub_id = "subscriptions/" + self._web_id
@@ -817,9 +951,157 @@ class ArloBackEnd(object):
             "User-Agent": self._user_agent,
         }
 
-    def _auth(self) -> AuthResult:
-        headers = self._auth_headers()
+    def _auth_trusted_browser(self, factor_id, headers):
+        """Finish a login on a browser Arlo already trusts.
 
+        No code and no waiting: startAuth on the BROWSER factor answers with a
+        full token straight away.
+        """
+        self.debug("browser is trusted, finishing without 2fa")
+        payload = {
+            "factorId": factor_id,
+            "factorType": "BROWSER",
+            "userId": self._user_id
+        }
+        self._options = self.auth_options(AUTH_START_PATH, headers)
+        code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+        if code != 200:
+            self._arlo.error(f"login failed: quick start failed: {code} - {body}")
+            return AuthResult.FAILED, None
+        return AuthResult.SUCCESS, body
+
+    def _start_factor_auth(self, factor, headers, factor_type="BROWSER"):
+        """POST startAuth for one factor - shared by the OTP and push flows,
+        and by the resumable `login_choose_factor()`.
+
+        `factor_type` is what push sends: an empty string rather than
+        `BROWSER`, matching what the Arlo apps do.
+        """
+        payload = {
+            "factorId": factor["factorId"],
+            "factorType": factor_type,
+            "userId": self._user_id
+        }
+        self._options = self.auth_options(AUTH_START_PATH, headers)
+        code, body = self.auth_post(AUTH_START_PATH, payload, headers)
+        if code != 200:
+            self._arlo.error(f"login failed: start failed: {code} - {body}")
+            return AuthResult.CAN_RETRY, None
+        return AuthResult.SUCCESS, body["factorAuthCode"]
+
+    def _finish_factor_auth(self, factor_auth_code, headers, otp=None):
+        """POST finishAuth for a typed code - shared by `_auth_with_otp()`
+        and the resumable `login_submit_code()`.
+        """
+        payload = {"factorAuthCode": factor_auth_code, "isBrowserTrusted": True}
+        if otp is not None:
+            payload["otp"] = otp
+        code, body = self.auth_post(AUTH_FINISH_PATH, payload, headers)
+        if code != 200:
+            self._arlo.error(f"login failed: finish failed: {code} - {body}")
+            return AuthResult.FAILED, None
+        return AuthResult.SUCCESS, body
+
+    def _check_push_auth(self, factor_auth_code, headers):
+        """One non-blocking finishAuth check for a push login - shared by
+        `_auth_with_push()`'s wait loop and the resumable `login_poll_push()`.
+
+        `AuthResult.CAN_RETRY` means "not yet, keep polling". `FAILED` means
+        denied. `SUCCESS` carries the finished auth body.
+        """
+        # Ask raw, so we can read the error number under the meta block and
+        # tell a denial from a "not yet".
+        code, body = self.auth_post(
+            AUTH_FINISH_PATH, {
+                "factorAuthCode": factor_auth_code,
+                "isBrowserTrusted": True
+            },
+            headers, raw=True,
+        )
+        meta = (body or {}).get("meta", {})
+
+        if code == 200 and meta.get("code") == 200:
+            return AuthResult.SUCCESS, body.get("data", {})
+        if meta.get("error") == TFA_PUSH_DENIED_ERROR:
+            return AuthResult.FAILED, None
+        return AuthResult.CAN_RETRY, None
+
+    def _auth_with_otp(self, factor, headers):
+        """Have Arlo send a code, then read it back from the configured source."""
+        tfa = self._get_tfa()
+        if tfa is None:
+            return AuthResult.FAILED, None
+        if tfa == TFA_PUSH_SOURCE:
+            self._arlo.error(
+                "login failed: tfa_source is 'push' but {} cannot be approved "
+                "from the phone app, pick a PUSH factor or another "
+                "tfa_source".format(self._describe_factor(factor))
+            )
+            return AuthResult.FAILED, None
+
+        # Snapshot the source before Arlo sends anything, so imap can tell the
+        # new mail from the old.
+        if not tfa.start():
+            self._arlo.error("login failed: 2fa: startup failed")
+            return AuthResult.FAILED, None
+
+        self.debug(f"starting auth with {self._describe_factor(factor)}")
+        result, factor_auth_code = self._start_factor_auth(factor, headers)
+        if result != AuthResult.SUCCESS:
+            tfa.stop()
+            return result, None
+
+        otp = tfa.get()
+        tfa.stop()
+        if otp is None:
+            self._arlo.error("login failed: 2fa: code retrieval failed")
+            return AuthResult.CAN_RETRY, None
+
+        self.debug("finishing auth")
+        return self._finish_factor_auth(factor_auth_code, headers, otp=otp)
+
+    def _auth_with_push(self, factor, headers):
+        """Wait for the user to approve the login in the Arlo phone app.
+
+        There is no code to type. Arlo pushes a prompt to the phone and we poll
+        finishAuth until it is approved, denied, or we run out of patience.
+        """
+        self.debug(f"starting push auth with {self._describe_factor(factor)}")
+        result, factor_auth_code = self._start_factor_auth(factor, headers, factor_type="")
+        if result != AuthResult.SUCCESS:
+            return result, None
+
+        timeout = self._arlo.cfg.tfa_push_timeout
+        poll = self._arlo.cfg.tfa_push_poll
+        name = factor.get("displayName") or factor.get("factorNickname") or "your phone"
+        self._arlo.info(
+            f"2fa: approve the login on {name}, waiting up to {timeout}s"
+        )
+
+        deadline = time.monotonic() + timeout
+        while True:
+            result, body = self._check_push_auth(factor_auth_code, headers)
+
+            if result == AuthResult.SUCCESS:
+                self.debug("push approved")
+                return result, body
+
+            if result == AuthResult.FAILED:
+                self._arlo.error("login failed: 2fa: the push was denied")
+                return result, None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._arlo.error(
+                    f"login failed: 2fa: nobody answered the push within {timeout}s"
+                )
+                return AuthResult.FAILED, None
+            time.sleep(min(poll, remaining))
+
+    def _signin(self, headers) -> tuple[AuthResult, dict | None]:
+        """POST username/password, retrying a couple of times on a Cloudflare
+        hiccup. Shared by `_auth()` and the resumable `login_start()`.
+        """
         # Handle 1015 error
         attempt = 0
         code = 0
@@ -845,10 +1127,46 @@ class ArloBackEnd(object):
 
         if body is None:
             self._arlo.error(f"login failed: {code} - possible cloudflare issue")
-            return AuthResult.CAN_RETRY
+            return AuthResult.CAN_RETRY, None
         if code != 200:
             self._arlo.error(f"login failed: {code} - {body}")
-            return AuthResult.FAILED
+            return AuthResult.FAILED, None
+        return AuthResult.SUCCESS, body
+
+    def _check_trusted_browser(self, headers):
+        """Ask Arlo if this browser is already paired.
+
+        Returns `(True, factor_id)` if it is - `_auth_trusted_browser` can
+        finish the login without bothering the user. Returns `(False,
+        factors)` if not, with the account's 2FA factor list (`None` on
+        error). Shared by `_auth()` and the resumable `login_start()`.
+        """
+        self.debug("getting tfa choices")
+        self._options = self.auth_options(AUTH_GET_FACTORID, headers)
+
+        # Is this browser already trusted? If it is Arlo hands us a BROWSER
+        # factor and we can finish without bothering the user at all.
+        payload = {
+            "factorType": "BROWSER",
+            "factorData": "",
+            "userId": self._user_id
+        }
+        code, body = self.auth_post(
+            AUTH_GET_FACTORID, payload, headers, cookies=self._cookies
+        )
+        if code == 200:
+            self._needs_pairing = False
+            return True, body["factorId"]
+
+        self._needs_pairing = True
+        return False, self._get_factors(headers)
+
+    def _auth(self) -> AuthResult:
+        headers = self._auth_headers()
+
+        result, body = self._signin(headers)
+        if result != AuthResult.SUCCESS:
+            return result
 
         # save new login information
         self._update_auth_info(body)
@@ -857,168 +1175,177 @@ class ArloBackEnd(object):
         if not body["authCompleted"]:
             self.debug("need 2FA...")
 
-            # update headers and create 2fa instance
             headers["Authorization"] = self._token64
-            tfa = self._get_tfa()
 
-            # get available 2fa choices,
-            self.debug("getting tfa choices")
-
-            self._options = self.auth_options(AUTH_GET_FACTORID, headers)
-
-            # look for code source choice
-            self.debug(f"looking for {self._arlo.cfg.tfa_type}/{self._arlo.cfg.tfa_nickname}")
-            factors_of_type = []
-            factor_id = None
-
-            payload = {
-                "factorType": "BROWSER",
-                "factorData": "",
-                "userId": self._user_id
-            }
-
-            code, body = self.auth_post(
-                AUTH_GET_FACTORID, payload, headers, cookies=self._cookies
-            )
-
-            if code == 200:
-                self._needs_pairing = False
-                factor_id = body["factorId"]
+            trusted, data = self._check_trusted_browser(headers)
+            if trusted:
+                result, body = self._auth_trusted_browser(data, headers)
             else:
-                self._needs_pairing = True
-                factors = self.auth_get(
-                    AUTH_GET_FACTORS + "?data = {}".format(int(time.time())), {}, headers
-                )
-                if factors is None:
+                factors = data
+                if not factors:
                     self._arlo.error("login failed: 2fa: no secondary choices available")
                     return AuthResult.FAILED
 
-                for factor in factors["items"]:
-                    if factor["factorType"].lower() == self._arlo.cfg.tfa_type:
-                        factors_of_type.append(factor)
-
-                if len(factors_of_type) > 0:
-                    # Try to match the factorNickname with the tfa_nickname
-                    for factor in factors_of_type:
-                        if self._arlo.cfg.tfa_nickname == factor["factorNickname"]:
-                            factor_id = factor["factorId"]
-                            break
-                    # Otherwise fallback to using the first option
-                    else:
-                        factor_id = factors_of_type[0]["factorId"]
-
-            if factor_id is None:
-                self._arlo.error("login failed: 2fa: no secondary choices available")
-                return AuthResult.FAILED
-
-            if code == 200:
-                payload = {
-                    "factorId": factor_id,
-                    "factorType": "BROWSER",
-                    "userId": self._user_id
-                }
-                self._options = self.auth_options(AUTH_START_PATH, headers)
-                code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-                if code != 200:
-                    self._arlo.error(f"login failed: quick start failed: {code} - {body}")
+                factor = self._select_factor(factors)
+                if factor is None:
                     return AuthResult.FAILED
 
-            elif tfa != TFA_PUSH_SOURCE:
-                # snapshot 2fa before sending in request
-                if not tfa.start():
-                    self._arlo.error("login failed: 2fa: startup failed")
-                    return AuthResult.FAILED
+                # Which flow to run is decided by the factor, not by the config.
+                # A PUSH factor has no code to type, so asking a code source for
+                # one would just hang until it gave up.
+                if factor.get("factorType", "").upper() == TFA_PUSH_TYPE:
+                    result, body = self._auth_with_push(factor, headers)
+                else:
+                    result, body = self._auth_with_otp(factor, headers)
 
-                # start authentication with email
-                self.debug(
-                    "starting auth with {}".format(self._arlo.cfg.tfa_type)
-                )
-                payload = {
-                    "factorId": factor_id,
-                    "factorType": "BROWSER",
-                    "userId": self._user_id
-                }
-                self._options = self.auth_options(AUTH_START_PATH, headers)
-                code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-                if code != 200:
-                    self._arlo.error(f"login failed: start failed: {code} - {body}")
-                    return AuthResult.CAN_RETRY
-                factor_auth_code = body["factorAuthCode"]
-
-                # get code from TFA source
-                code = tfa.get()
-                if code is None:
-                    self._arlo.error(f"login failed: 2fa: code retrieval failed")
-                    return AuthResult.CAN_RETRY
-
-                # tidy 2fa
-                tfa.stop()
-
-                # finish authentication
-                self.debug("finishing auth")
-                code, body = self.auth_post(
-                    AUTH_FINISH_PATH, {
-                        "factorAuthCode": factor_auth_code,
-                        "otp": code,
-                        "isBrowserTrusted": True
-                    },
-                    headers,
-                )
-                if code != 200:
-                    self._arlo.error(f"login failed: finish failed: {code} - {body}")
-                    return AuthResult.FAILED
-            else:
-                # start authentication
-                self.debug(
-                    "starting auth with {}".format(self._arlo.cfg.tfa_type)
-                )
-                payload = {
-                    "factorId": factor_id,
-                    "factorType": "",
-                    "userId": self._user_id
-                }
-                code, body = self.auth_post(AUTH_START_PATH, payload, headers)
-                if code != 200:
-                    self._arlo.error(f"login failed: start failed: {code} - {body}")
-                    return AuthResult.FAILED
-                factor_auth_code = body["factorAuthCode"]
-                tries = 1
-                while True:
-                    # finish authentication
-                    self.debug("finishing auth")
-                    code, body = self.auth_post(
-                        AUTH_FINISH_PATH, {
-                            "factorAuthCode": factor_auth_code,
-                            "isBrowserTrusted": True
-                        },
-                        headers,
-                    )
-                    if code != 200:
-                        self._arlo.warning("2fa finishAuth - tries {}".format(tries))
-                        if tries < self._arlo.cfg.tfa_retries:
-                            time.sleep(self._arlo.cfg.tfa_delay)
-                            tries += 1
-                        else:
-                            self._arlo.error(f"login failed: finish failed: {code} - {body}")
-                            return AuthResult.FAILED
-                    else:
-                        break
+            if result != AuthResult.SUCCESS:
+                return result
 
             # save new login information
             self._update_auth_info(body)
 
         return AuthResult.SUCCESS
 
+    def _finish_login(self, body) -> bool:
+        """Finish an interactive login: record the token, validate it, pair
+        the browser if needed, and persist both to disk.
+
+        Used by the resumable `login_*` API once a factor's auth body comes
+        back - mirrors what `_authenticate()` does inline for the classic
+        blocking login path.
+        """
+        self._update_auth_info(body)
+        if not (self._validate() and self._pair_auth_code()):
+            return False
+        self._logged_in = True
+        self._save_session()
+        return True
+
+    def login_start(self) -> LoginStep:
+        """Begin an interactive login: reuse a saved session if we still can,
+        else sign in with the password and see whether 2FA is needed.
+
+        Returns `SUCCESS` if nothing more is needed (a resumed session, or an
+        already-trusted browser), `NEEDS_FACTOR` if the caller must pick one
+        of `login_factors` and call `login_choose_factor()`, or `FAILED`
+        (see `last_error`).
+        """
+        self._user_agent = self.user_agent(self._arlo.cfg.user_agent)
+        if self._session is None:
+            self._create_session()
+
+        if self._resume_session():
+            return LoginStep.SUCCESS
+
+        headers = self._auth_headers()
+        result, body = self._signin(headers)
+        if result != AuthResult.SUCCESS:
+            return LoginStep.FAILED
+
+        self._update_auth_info(body)
+
+        if body["authCompleted"]:
+            return LoginStep.SUCCESS if self._finish_login(body) else LoginStep.FAILED
+
+        headers["Authorization"] = self._token64
+        trusted, data = self._check_trusted_browser(headers)
+        if trusted:
+            result, body = self._auth_trusted_browser(data, headers)
+            if result != AuthResult.SUCCESS:
+                return LoginStep.FAILED
+            return LoginStep.SUCCESS if self._finish_login(body) else LoginStep.FAILED
+
+        factors = data
+        if not factors:
+            self._arlo.error("login failed: 2fa: no secondary choices available")
+            return LoginStep.FAILED
+
+        self._login_factors = factors
+        return LoginStep.NEEDS_FACTOR
+
+    @property
+    def login_factors(self):
+        """The 2FA factors offered after `login_start()` returns `NEEDS_FACTOR`."""
+        return self._login_factors
+
+    def login_choose_factor(self, factor_id) -> LoginStep:
+        """Start auth with one of the factors from `login_factors`.
+
+        Returns `AWAITING_PUSH` if the caller should now poll
+        `login_poll_push()`, `AWAITING_CODE` if it should collect a typed
+        code and call `login_submit_code()`, or `FAILED`.
+        """
+        factors = self._login_factors or []
+        factor = next((f for f in factors if f.get("factorId") == factor_id), None)
+        if factor is None:
+            known = ", ".join(self._describe_factor(f) for f in factors)
+            self._arlo.error(f"2fa: no factor with id {factor_id}, this account has: {known}")
+            return LoginStep.FAILED
+
+        headers = self._auth_headers()
+        headers["Authorization"] = self._token64
+        self._login_headers = headers
+        self._login_factor = factor
+
+        if factor.get("factorType", "").upper() == TFA_PUSH_TYPE:
+            result, factor_auth_code = self._start_factor_auth(factor, headers, factor_type="")
+            if result != AuthResult.SUCCESS:
+                return LoginStep.FAILED
+            self._login_factor_auth_code = factor_auth_code
+            timeout = self._arlo.cfg.tfa_push_timeout
+            self._login_push_deadline = time.monotonic() + timeout
+            name = factor.get("displayName") or factor.get("factorNickname") or "your phone"
+            self._arlo.info(f"2fa: approve the login on {name}, waiting up to {timeout}s")
+            return LoginStep.AWAITING_PUSH
+
+        result, factor_auth_code = self._start_factor_auth(factor, headers)
+        if result != AuthResult.SUCCESS:
+            return LoginStep.FAILED
+        self._login_factor_auth_code = factor_auth_code
+        return LoginStep.AWAITING_CODE
+
+    def login_poll_push(self) -> LoginStep:
+        """One non-blocking check of a push login started with
+        `login_choose_factor()`. Call again after `tfa_push_poll` seconds
+        while it keeps returning `AWAITING_PUSH`.
+        """
+        result, body = self._check_push_auth(self._login_factor_auth_code, self._login_headers)
+
+        if result == AuthResult.SUCCESS:
+            return LoginStep.SUCCESS if self._finish_login(body) else LoginStep.FAILED
+
+        if result == AuthResult.FAILED:
+            self._arlo.error("login failed: 2fa: the push was denied")
+            return LoginStep.FAILED
+
+        if time.monotonic() >= self._login_push_deadline:
+            timeout = self._arlo.cfg.tfa_push_timeout
+            self._arlo.error(f"login failed: 2fa: nobody answered the push within {timeout}s")
+            return LoginStep.FAILED
+
+        return LoginStep.AWAITING_PUSH
+
+    def login_submit_code(self, otp) -> LoginStep:
+        """Finish an EMAIL/SMS login with the code the user typed in,
+        started with `login_choose_factor()`.
+        """
+        result, body = self._finish_factor_auth(self._login_factor_auth_code, self._login_headers, otp=otp)
+        if result != AuthResult.SUCCESS:
+            return LoginStep.FAILED
+        return LoginStep.SUCCESS if self._finish_login(body) else LoginStep.FAILED
+
     def _validate(self):
         headers = self._auth_headers()
         headers["Authorization"] = self._token64
 
-        # Validate it!
-        validated = self.auth_get(
+        # Validate it! The auth API answers a rejected token with http 200 and
+        # an error in the `meta` block, so we have to look at the code rather
+        # than just check we got a body back.
+        code, body = self.auth_get_tuple(
             AUTH_VALIDATE_PATH + "?data = {}".format(int(time.time())), {}, headers
         )
-        if validated is None:
-            self._arlo.error("token validation failed")
+        if code != 200:
+            self._arlo.error(f"token validation failed: {code} - {body}")
             return False
         return True
 
@@ -1028,7 +1355,7 @@ class ArloBackEnd(object):
 
         if not self._needs_pairing:
             self._arlo.debug("no pairing required")
-            self._save_cookies(self._cookies)
+            self._save_cookies()
             return True
         if self._browser_auth_code is None:
             self._arlo.debug("pairing postponed")
@@ -1041,7 +1368,7 @@ class ArloBackEnd(object):
             "factorType": "BROWSER"
         }
         code, body = self.auth_post(AUTH_START_PAIRING, payload, headers, cookies=self._cookies)
-        self._save_cookies(self._cookies)
+        self._save_cookies()
 
         if code != 200:
             self._arlo.error(f"pairing: failed: {code} - {body}")
@@ -1079,21 +1406,60 @@ class ArloBackEnd(object):
         if self._cookies is not None:
             self._session.cookies = self._cookies
 
+    def _resume_session(self):
+        """Try to carry on with the token we saved last time.
+
+        This is what the web app does when you reload the page: it keeps the
+        token in local storage and only revalidates it. Reusing it saves a
+        password POST on every restart and, more to the point, on every event
+        stream reconnect - and it is that stream of password posts that upsets
+        CloudFlare.
+
+        Arlo tokens only last a couple of hours, so this helps within that
+        window rather than across days. That is still most reconnects.
+        """
+        if not self._arlo.cfg.reuse_session:
+            return False
+        if self._token is None or self._user_id is None:
+            self.debug("no saved token to resume")
+            return False
+
+        left = seconds_until(self._expires_in)
+        if left < TOKEN_MIN_SECONDS_LEFT:
+            self.debug(f"saved token expires in {left:.0f}s, logging in again")
+            return False
+
+        if not self._validate():
+            self.debug("saved token rejected, logging in again")
+            return False
+
+        self.debug(f"resumed saved session, token good for another {left:.0f}s")
+        self._needs_pairing = False
+        self._save_cookies()
+        return True
+
+    def _authenticate(self) -> AuthResult:
+        """Get us a usable token, reusing the saved one when we still can."""
+        if self._resume_session():
+            return AuthResult.SUCCESS
+
+        result = self._auth()
+        if result != AuthResult.SUCCESS:
+            return result
+        if not (self._validate() and self._pair_auth_code()):
+            # Worth another go on a different CloudFlare curve.
+            return AuthResult.CAN_RETRY
+        return AuthResult.SUCCESS
+
     def _login(self):
 
         # pickup user configured user agent
         self._user_agent = self.user_agent(self._arlo.cfg.user_agent)
 
-        # we always login but and let the backend determine if we need to
-        # use 2fa
         success = AuthResult.FAILED
         if self._arlo.cfg.http_backend == "curl_cffi":
             self._create_session()
-            success = self._auth()
-            if success == AuthResult.FAILED:
-                return False
-            if success == AuthResult.SUCCESS and not (self._validate() and self._pair_auth_code()):
-                success = AuthResult.FAILED
+            success = self._authenticate()
         else:
             for curve in self._arlo.cfg.ecdh_curves:
                 self.debug(f"CloudFlare curve set to: {curve}")
@@ -1101,12 +1467,9 @@ class ArloBackEnd(object):
 
                 # Try to authenticate. We retry if it was a cloud flare
                 # error or we failed to get the 2FA code.
-                success = self._auth()
-                if success == AuthResult.FAILED:
-                    return False
-                if success == AuthResult.SUCCESS and self._validate() and self._pair_auth_code():
+                success = self._authenticate()
+                if success != AuthResult.CAN_RETRY:
                     break
-                success = AuthResult.FAILED
                 self.debug("login failed, trying another ecdh_curve")
 
         if success != AuthResult.SUCCESS:
@@ -1254,12 +1617,13 @@ class ArloBackEnd(object):
         if wait_for == "response":
             self.vdebug("get+response running")
             return self._request(
-                path, "GET", params, headers, stream, raw, timeout, host, cookies
+                path, "GET", params, headers, stream, raw, timeout, host, cookies=cookies
             )
         else:
             self.vdebug("get sent")
             self._arlo.bg.run(
-                self._request, path, "GET", params, headers, stream, raw, timeout, host
+                self._request, path=path, method="GET", params=params, headers=headers,
+                stream=stream, raw=raw, timeout=timeout, host=host, cookies=cookies
             )
 
     def put(
@@ -1274,11 +1638,14 @@ class ArloBackEnd(object):
     ):
         if wait_for == "response":
             self.vdebug("put+response running")
-            return self._request(path, "PUT", params, headers, False, raw, timeout, cookies)
+            return self._request(
+                path, "PUT", params, headers, False, raw, timeout, cookies=cookies
+            )
         else:
             self.vdebug("put sent")
             self._arlo.bg.run(
-                self._request, path, "PUT", params, headers, False, raw, timeout
+                self._request, path=path, method="PUT", params=params, headers=headers,
+                raw=raw, timeout=timeout, cookies=cookies
             )
 
     def post(
@@ -1318,12 +1685,24 @@ class ArloBackEnd(object):
         else:
             self.vdebug("post sent")
             self._arlo.bg.run(
-                self._request, path, "POST", params, headers, False, raw, timeout
+                self._request, path=path, method="POST", params=params, headers=headers,
+                raw=raw, timeout=timeout
             )
 
     def auth_post(self, path, params=None, headers=None, raw=False, timeout=None, cookies=None):
         return self._request_tuple(
             path, "POST", params, headers, False, raw, timeout, self._arlo.cfg.auth_host, authpost=True, cookies=cookies
+        )
+
+    def auth_get_tuple(self, path, params=None, headers=None, timeout=None, cookies=None):
+        """Auth host GET that reports the status code as well as the body.
+
+        The auth API signals failure inside a `meta` block on an http 200, so
+        callers that care about success need the code, not just the body.
+        """
+        return self._request_tuple(
+            path, "GET", params, headers, False, False, timeout,
+            self._arlo.cfg.auth_host, authpost=True, cookies=cookies
         )
 
     def auth_get(
