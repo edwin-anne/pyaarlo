@@ -29,6 +29,8 @@ from .constant import (
     MODEL_PRO_3_FLOODLIGHT,
     MODEL_PRO_4,
     MODEL_PRO_5,
+    MODEL_PRO_6,
+    MODEL_PRO_6_XL,
     MODEL_WIRED_VIDEO_DOORBELL,
     MODEL_WIRED_VIDEO_DOORBELL_GEN2_2K,
     MODEL_WIRED_VIDEO_DOORBELL_GEN2_HD,
@@ -596,6 +598,8 @@ class ArloBase(ArloDevice):
                     MODEL_PRO_3_FLOODLIGHT,
                     MODEL_PRO_4,
                     MODEL_PRO_5,
+                    MODEL_PRO_6,
+                    MODEL_PRO_6_XL,
                     MODEL_WIRED_VIDEO_DOORBELL_GEN2_2K,
                     MODEL_WIRED_VIDEO_DOORBELL_GEN2_HD,
             )):

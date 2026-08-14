@@ -11,7 +11,7 @@ def readme():
 setup(
 
     name='pyaarlo',
-    version='0.8.0.21',
+    version='0.8.0.23',
     packages=['pyaarlo'],
 
     python_requires='>=3.7',
@@ -24,7 +24,8 @@ setup(
         'curl_cffi',
         'paho-mqtt',
         'cryptography',
-        'python-slugify'
+        'python-slugify',
+        'websocket-client'
     ],
 
     author='Steve Herrell',
