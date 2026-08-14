@@ -240,6 +240,79 @@ interface, you need to mount the NAS device and point `save_media_to` at it.
 Pyaarlo supports 2 factor authentication.
 
 
+<a name="2fa-factors"></a>
+#### Choosing which factor to use
+
+Arlo calls each 2FA destination a _factor_ - an email address, a phone number,
+or a phone running the Arlo app. To see the ones on your account:
+
+```console
+$ pyaarlo -u USERNAME -p PASSWORD list-2fa
+2fa factors:
+ home@example.com
+  factor-id:12345678-1234-1234-1234-1234567890ab
+  type:EMAIL
+  role:PRIMARY
+  nickname:home@example.com
+ Pixel 9
+  factor-id:87654321-4321-4321-4321-ba0987654321
+  type:PUSH
+  role:SECONDARY
+  nickname:Pixel 9
+```
+
+or from code, once logged in:
+
+```python
+for factor in ar.tfa_factors():
+    print(factor["factorType"], factor["factorNickname"], factor["factorId"])
+```
+
+By default Pyaarlo picks a factor by matching `tfa_type` and then
+`tfa_nickname`. If your account has several factors of the same type that
+guessing gets unreliable, so pass the id of the one you want instead - it wins
+over both `tfa_type` and `tfa_nickname`:
+
+```python
+ar = pyaarlo.PyArlo(username=USERNAME, password=PASSWORD,
+                    tfa_source='console',
+                    tfa_factor_id='87654321-4321-4321-4321-ba0987654321')
+```
+
+
+<a name="2fa-push"></a>
+#### Push (approve from the Arlo app)
+
+The least fiddly option, if you have the Arlo app on your phone. Arlo sends a
+prompt to the phone, you tap approve, and Pyaarlo carries on. No mailbox to
+give access to, no code to parse, no third party service.
+
+You need a `PUSH` factor on the account - it appears in `list-2fa` once you
+have logged into the Arlo app on that phone.
+
+```python
+ar = pyaarlo.PyArlo(username=USERNAME, password=PASSWORD,
+                    tfa_source='push', tfa_type='PUSH')
+```
+
+With more than one phone registered, name the one you want:
+
+```python
+ar = pyaarlo.PyArlo(username=USERNAME, password=PASSWORD,
+                    tfa_source='push',
+                    tfa_factor_id='UGluZ09uZVNESzpQVVNIOi...')
+```
+
+Pyaarlo waits 5 minutes for you to approve, checking every 5 seconds, matching
+the Arlo web app. Tune with `tfa_push_timeout` and `tfa_push_poll` if you want.
+If you tap deny, the login fails straight away rather than waiting out the
+timer.
+
+Note the flow is chosen by the factor, not by `tfa_source`: point
+`tfa_factor_id` at a `PUSH` factor and you get the approval prompt even if
+`tfa_source` still says `console`.
+
+
 <a name="2fa-manual"></a>
 #### Manual
 
@@ -353,6 +426,30 @@ curl -s -F 'plain_text_file=@-;filename=clear.txt' https://pyaarlo-tfa.appspot.c
 ```
 
 You can also encrypt your output on this [webpage](https://pyaarlo-tfa.appspot.com/).
+
+
+<a name="testing"></a>
+## Testing
+
+The test suite needs no Arlo account and no network. It runs the login against
+a fake Arlo server, so it covers the session file, the cookie jar and the 2FA
+factor handling for real.
+
+```console
+$ python -m unittest discover -s tests -t .
+```
+
+To check the login against the actual Arlo servers, including whether your
+saved session is being reused rather than logging in every time:
+
+```console
+$ export ARLO_USERNAME=you@example.com
+$ export ARLO_PASSWORD=your-password
+$ ./examples/check-login
+```
+
+It logs in twice and tells you which parts were needed each time. Add `--fresh`
+to wipe the saved session first and exercise the full 2FA path.
 
 
 <a name="limitations"></a>

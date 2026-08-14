@@ -327,6 +327,37 @@ def list(item):
     _print_end()
 
 
+@cli.command(name='list-2fa')
+def list_2fa():
+    """List the 2FA factors configured on the Arlo account.
+
+    Pass the factor-id of the one you want as the `tfa_factor_id` option to
+    send future codes to that factor.
+    """
+    ar = login()
+    _print_start()
+    factors = ar.tfa_factors()
+    if factors is None:
+        _print("unable to read the 2fa factor list")
+    elif not factors:
+        _print("no 2fa factors configured")
+    else:
+        _print("2fa factors:")
+        for factor in factors:
+            name = factor.get("displayName") or factor.get("factorNickname") or "?"
+            if opts["compact"]:
+                _print(" {};fid={};type={};role={}".format(
+                    name, factor.get("factorId"), factor.get("factorType"),
+                    factor.get("factorRole")))
+            else:
+                _print(" {}".format(name))
+                _print("  factor-id:{}".format(factor.get("factorId")))
+                _print("  type:{}".format(factor.get("factorType")))
+                _print("  role:{}".format(factor.get("factorRole")))
+                _print("  nickname:{}".format(factor.get("factorNickname")))
+    _print_end()
+
+
 @cli.command()
 def encrypt():
     in_text = sys.stdin.read()

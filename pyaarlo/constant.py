@@ -46,6 +46,11 @@ AUTH_GET_FACTORID = "/api/getFactorId"
 AUTH_VALIDATE_PATH = "/api/validateAccessToken"
 AUTH_START_PAIRING = "/api/startPairingFactor"
 
+# Errors getFactorId answers with when this browser has never been paired.
+# Expected on a first login, so they are not worth warning about. 9204 is the
+# classic backend, 9261 "Invalid factor data" is what the PingOne one returns.
+AUTH_UNTRUSTED_ERRORS = (9204, 9261)
+
 TFA_CONSOLE_SOURCE = "console"
 TFA_IMAP_SOURCE = "imap"
 TFA_REST_API_SOURCE = "rest-api"
@@ -55,7 +60,30 @@ TFA_SMS_TYPE = "SMS"
 TFA_PUSH_TYPE = "PUSH"
 TFA_DELAY = 5
 TFA_RETRIES = 5
+
+# How long to wait, in seconds, for the user to approve a push notification,
+# and how often to check. The web app allows five minutes and polls every five.
+TFA_PUSH_TIMEOUT = 300
+TFA_PUSH_POLL = 5
+
+# What finishAuth reports when the user taps deny on the phone. Read out of the
+# my.arlo.com bundle, where error 9239 maps to its PUSH_VERIFICATION_FAILURE.
+TFA_PUSH_DENIED_ERROR = 9239
 TFA_DEFAULT_HOST = "https://pyaarlo-tfa.appspot.com"
+TFA_SOURCES = (
+    TFA_CONSOLE_SOURCE,
+    TFA_IMAP_SOURCE,
+    TFA_REST_API_SOURCE,
+    TFA_PUSH_SOURCE,
+)
+
+# Reuse a saved token if it has at least this many seconds left on it. Below
+# that we log in again rather than risk it expiring mid startup.
+#
+# Arlo tokens are short lived - measured at two hours - so this has to be a
+# small margin. A threshold on the scale of days would reject every token Arlo
+# has ever issued.
+TOKEN_MIN_SECONDS_LEFT = 10 * 60
 
 PRELOAD_DAYS = 30
 

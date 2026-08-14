@@ -40,12 +40,30 @@ def now_strftime(date_format="%Y-%m-%dT%H:%M:%S"):
     return datetime.now().strftime(date_format)
 
 
-def days_until(when):
-    now = datetime.now()
-    when = datetime.utcfromtimestamp(when)
-    if when <= now:
+def expiry_to_epoch(when):
+    """Convert an Arlo `expiresIn` value into a Unix epoch in seconds.
+
+    Arlo isn't consistent here, some responses use seconds and some use
+    milliseconds. Anything beyond the year 5138 has to be milliseconds.
+    """
+    if when is None:
         return 0
-    return (when - now).days
+    try:
+        when = float(when)
+    except (TypeError, ValueError):
+        return 0
+    if when > 1e11:
+        when /= 1000
+    return when
+
+
+def seconds_until(when):
+    """Seconds left on an Arlo `expiresIn` value, 0 once it has passed.
+
+    Arlo tokens are short lived, around two hours, so measure this in seconds.
+    Anything coarser rounds every real token down to nothing.
+    """
+    return max(0, expiry_to_epoch(when) - time.time())
 
 
 def httptime_to_datetime(http_timestamp):
