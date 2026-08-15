@@ -87,6 +87,14 @@ TOKEN_MIN_SECONDS_LEFT = 10 * 60
 
 PRELOAD_DAYS = 30
 
+# Backoff between re-login attempts in the event stream thread. Doubles on
+# each consecutive failure up to the cap, and resets once a login succeeds.
+# Without this the thread hammered Arlo's (Cloudflare-fronted) login endpoint
+# every few seconds on a persistent auth failure, which is what triggers
+# Cloudflare's 429 rate limiting in the first place.
+RELOGIN_BACKOFF_BASE = 5
+RELOGIN_BACKOFF_MAX = 300
+
 # Start up delays.
 REFRESH_CAMERA_DELAY = 5
 INITIAL_REFRESH_DELAY = REFRESH_CAMERA_DELAY + 3
