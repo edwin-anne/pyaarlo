@@ -36,6 +36,8 @@ from .constant import (
     NOTIFY_PATH,
     ORIGIN_HOST,
     REFERER_HOST,
+    RELOGIN_BACKOFF_BASE,
+    RELOGIN_BACKOFF_MAX,
     SESSION_PATH,
     SUBSCRIBE_PATH,
     TFA_CONSOLE_SOURCE,
@@ -542,14 +544,20 @@ class ArloBackEnd(object):
                     time_stamp = now_strftime("%Y-%m-%d %H:%M:%S.%f")
                     dump.write("{}: {}\n".format(time_stamp, "event_thread start"))
 
-            # login again if not first iteration, this will also create a new session
+            # login again if not first iteration, this will also create a new session.
+            # Back off on consecutive failures so a persistent auth problem doesn't
+            # turn into a tight retry loop against Arlo's (Cloudflare-fronted) login
+            # endpoint - that's what trips Cloudflare's 429 rate limiting.
+            retry_wait = RELOGIN_BACKOFF_BASE
             while not self._logged_in and not self._stop_thread:
                 with self._lock:
-                    self._lock.wait(5)
+                    self._lock.wait(retry_wait)
                 if self._stop_thread:
                     break
                 self.debug("re-logging in")
                 self._logged_in = self._login()
+                if not self._logged_in:
+                    retry_wait = min(retry_wait * 2, RELOGIN_BACKOFF_MAX)
 
             if self._use_mqtt:
                 self._mqtt_main()
