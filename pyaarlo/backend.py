@@ -87,6 +87,7 @@ class ArloBackEnd(object):
     _multi_location = False
     _user_device_id = None
     _browser_auth_code = None
+    _paired_user_agent: str | None = None
     _user_id: str | None = None
     _web_id: str | None = None
     _sub_id: str | None = None
@@ -154,6 +155,7 @@ class ArloBackEnd(object):
         self._expires_in = 0
         self._browser_auth_code = None
         self._user_device_id = None
+        self._paired_user_agent = None
         if not self._arlo.cfg.save_session:
             return
         try:
@@ -179,6 +181,8 @@ class ArloBackEnd(object):
                             self._browser_auth_code = session_info["browser_auth_code"]
                         if "device_id" in session_info:
                             self._user_device_id = session_info["device_id"]
+                        if "user_agent" in session_info:
+                            self._paired_user_agent = session_info["user_agent"]
                         self.debug(f"loadv{version}:session_info={ArloBackEnd._session_info}")
                     else:
                         self.debug(f"loadv{version}:failed")
@@ -202,6 +206,7 @@ class ArloBackEnd(object):
                         "expires_in": self._expires_in,
                         "browser_auth_code": self._browser_auth_code,
                         "device_id": self._user_device_id,
+                        "user_agent": self._paired_user_agent,
                     }
                     pickle.dump(ArloBackEnd._session_info, dump)
                     self.debug(f"savev2:session_info={ArloBackEnd._session_info}")
@@ -1059,7 +1064,17 @@ class ArloBackEnd(object):
             tfa.stop()
             return result, None
 
-        otp = tfa.get()
+        # `tfa.get()` can raise - the console source blocks on stdin and
+        # raises EOFError when there's no TTY (e.g. a re-login from the
+        # background event thread). Left uncaught this kills that thread
+        # for good, since nothing above catches thread exceptions; treat it
+        # like any other failed code retrieval so the caller's backoff loop
+        # keeps retrying instead.
+        try:
+            otp = tfa.get()
+        except Exception as e:
+            self._arlo.warning(f"2fa: code retrieval raised {type(e).__name__}: {e}")
+            otp = None
         tfa.stop()
         if otp is None:
             self._arlo.error("login failed: 2fa: code retrieval failed")
@@ -1166,6 +1181,14 @@ class ArloBackEnd(object):
             self._needs_pairing = False
             return True, body["factorId"]
 
+        # Expected/silent for a genuinely untrusted browser (the caller's
+        # auth_post already stays quiet for AUTH_UNTRUSTED_ERRORS) - but
+        # worth a breadcrumb, since a *previously* trusted browser that
+        # stops being recognised (e.g. a user-agent/device-id mismatch
+        # between where it was paired and where it's being used) looks
+        # identical from here otherwise, and that's expensive to diagnose
+        # blind.
+        self.debug(f"browser not trusted: {code} - {body}")
         self._needs_pairing = True
         return False, self._get_factors(headers)
 
@@ -1238,7 +1261,7 @@ class ArloBackEnd(object):
         of `login_factors` and call `login_choose_factor()`, or `FAILED`
         (see `last_error`).
         """
-        self._user_agent = self.user_agent(self._arlo.cfg.user_agent)
+        self._user_agent = self._resolve_user_agent()
         if self._session is None:
             self._create_session()
 
@@ -1459,14 +1482,44 @@ class ArloBackEnd(object):
             return AuthResult.CAN_RETRY
         return AuthResult.SUCCESS
 
+    def _resolve_user_agent(self):
+        """Pick the user agent to authenticate with.
+
+        The trusted-browser factor Arlo hands back after 2FA is bound to
+        the identity (user agent + device id) that was active at pairing
+        time. Once we know what that was, keep using it even if
+        `cfg.user_agent` changes later - e.g. a HA options edit - so a
+        config change can't silently strand an otherwise-valid trust and
+        force 2FA again. A first-ever login has nothing paired yet, so it
+        adopts whatever is configured and that becomes the pinned value
+        going forward once `_save_session()` runs.
+        """
+        configured = self.user_agent(self._arlo.cfg.user_agent)
+        if self._paired_user_agent is None:
+            self._paired_user_agent = configured
+        elif self._paired_user_agent != configured:
+            self._arlo.warning(
+                "user_agent changed since this browser was trusted - "
+                "keeping the paired one so the existing trust doesn't break"
+            )
+        return self._paired_user_agent
+
     def _login(self):
 
-        # pickup user configured user agent
-        self._user_agent = self.user_agent(self._arlo.cfg.user_agent)
+        # pickup user configured user agent, pinned to whatever this
+        # browser was originally trusted under
+        self._user_agent = self._resolve_user_agent()
 
         success = AuthResult.FAILED
         if self._arlo.cfg.http_backend == "curl_cffi":
-            self._create_session()
+            # An ordinary SSE/MQTT stream drop calls _login() again but
+            # doesn't mean the session is bad - only build a fresh HTTP
+            # session (new TLS/Cloudflare handshake) if we don't have one
+            # yet. _authenticate() -> _resume_session() still validates the
+            # saved token against Arlo before trusting it, so a token that
+            # really was rejected still falls through to a full _auth().
+            if self._session is None:
+                self._create_session()
             success = self._authenticate()
         else:
             for curve in self._arlo.cfg.ecdh_curves:
